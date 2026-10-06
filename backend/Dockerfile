@@ -1,6 +1,7 @@
 FROM python:3.11-slim AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
     build-essential \
     libpq-dev \
     libgl1 \
@@ -22,7 +23,7 @@ RUN pip install --no-cache-dir uv && \
 COPY . .
 
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 EXPOSE 8000
 

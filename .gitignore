@@ -49,3 +49,6 @@ pnpm-debug.log*
 # OS
 Thumbs.db
 babeldoc.tar.gz
+
+# Docker Compose 本地覆盖（含本机路径/密钥，参考 docker-compose.override.example.yml）
+docker-compose.override.yml

@@ -1,0 +1,30 @@
+# 本地开发覆盖配置示例（docker compose 会自动合并 docker-compose.override.yml）
+# 用法：复制本文件为 docker-compose.override.yml 并按本机环境修改
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#
+# 适用场景：
+# 1. Windows 上 5432 落入系统保留端口段（Hyper-V/WSL 常保留 5041-5440 等）
+# 2. 本地构建的镜像不含 /app/bundled-offline-assets，需关闭启动离线恢复/预检
+# 3. 复用宿主机已下载完整的 BabelDOC 缓存（模型/字体/CMap/tiktoken）
+# 4. 后端额外暴露 8000 端口，便于直接调 API 调试
+services:
+  postgres:
+    # compose 对 ports 默认追加合并，用 !override 整体替换，避免仍绑定宿主 5432
+    ports: !override
+      - "55433:5432"
+
+  backend:
+    environment:
+      BABELDOC_OFFLINE_MODE: "false"
+      BABELDOC_OFFLINE_ASSETS_PACKAGE: ""
+      BABELDOC_PRECHECK_ASSETS_ON_STARTUP: "false"
+      SECRET_KEY: "change-me-to-a-long-random-string"
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend_uploads:/app/uploads
+      - backend_outputs:/app/outputs
+      # Windows 示例（Docker Desktop 可识别 C:/ 路径），按实际用户名修改：
+      - C:/Users/<YOUR_USERNAME>/.cache/babeldoc:/root/.cache/babeldoc
+      # Linux/macOS 示例（二选一，注释掉上面一行）：
+      # - ${HOME}/.cache/babeldoc:/root/.cache/babeldoc

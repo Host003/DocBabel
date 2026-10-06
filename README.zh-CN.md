@@ -313,7 +313,7 @@ web/
 
 本项目采用 [AGPL-3.0](LICENSE) 许可证，与其运行时依赖 [BabelDOC](https://github.com/funstory-ai/BabelDOC) 的许可证策略保持一致。
 
-> **注意：** 后端依赖声明位于 [backend/pyproject.toml](backend/pyproject.toml)，当前固定依赖 `babeldoc==0.5.23`。如果将本项目用于网络服务、再分发或二次修改发布，需要同步评估 BabelDOC 及其第三方依赖带来的许可证义务。本节仅作为工程合规提醒，不构成法律意见。
+> **注意：** 后端依赖声明位于 [backend/pyproject.toml](backend/pyproject.toml)，当前固定依赖 `Host003/BabelDOC` fork 的 commit `8784908`（对应 `babeldoc` v0.6.4）。如果将本项目用于网络服务、再分发或二次修改发布，需要同步评估 BabelDOC 及其第三方依赖带来的许可证义务。本节仅作为工程合规提醒，不构成法律意见。
 
 ## 参与贡献
 

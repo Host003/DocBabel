@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         postgresql-client-15 \
         nginx \
         supervisor \
+        git \
         build-essential \
         libpq-dev \
         libgl1 \

@@ -303,7 +303,7 @@ The platform supports `extra_body` at both the model-default level and the per-t
 
 This project is licensed under [AGPL-3.0](LICENSE), aligned with its runtime dependency [BabelDOC](https://github.com/funstory-ai/BabelDOC).
 
-> **Note:** The backend pins `babeldoc==0.5.23` in [backend/pyproject.toml](backend/pyproject.toml). If you deploy this project as a network service, redistribute it, or publish modified versions, review the license obligations inherited from BabelDOC and its third-party dependencies. This is an engineering compliance reminder, not legal advice.
+> **Note:** The backend pins the `Host003/BabelDOC` fork at commit `8784908` (i.e. `babeldoc` v0.6.4) in [backend/pyproject.toml](backend/pyproject.toml). If you deploy this project as a network service, redistribute it, or publish modified versions, review the license obligations inherited from BabelDOC and its third-party dependencies. This is an engineering compliance reminder, not legal advice.
 
 ## Contributing
 
