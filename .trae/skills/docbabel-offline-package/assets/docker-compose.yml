@@ -1,0 +1,86 @@
+# DocBabel 离线部署专用 docker-compose（镜像全部来自 images/ 目录，禁止联网拉取）
+# 可用同目录 .env 文件覆盖配置，参考 config/.env.example
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    pull_policy: never
+    container_name: ${COMPOSE_PROJECT_NAME:-babeldoc}-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-babeldoc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-babeldoc}
+      POSTGRES_DB: ${POSTGRES_DB:-babeldoc}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # 仅用于宿主机调试数据库；Windows 上 5432 可能落入保留端口段，可在 .env 设 POSTGRES_PORT=55433
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-babeldoc}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    pull_policy: never
+    container_name: ${COMPOSE_PROJECT_NAME:-babeldoc}-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ghcr.io/ccsert/babeldoc-backend:latest
+    pull_policy: never
+    container_name: ${COMPOSE_PROJECT_NAME:-babeldoc}-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-babeldoc}:${POSTGRES_PASSWORD:-babeldoc}@postgres:5432/${POSTGRES_DB:-babeldoc}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-please-change-this-secret-key}
+      DEBUG: "false"
+      # 离线资产已内置在后端镜像 /root/.cache/babeldoc 中：
+      # 开启离线模式与启动预检；不指定资产包路径（无需启动时恢复）
+      BABELDOC_OFFLINE_MODE: "true"
+      BABELDOC_OFFLINE_ASSETS_PACKAGE: ""
+      BABELDOC_PRECHECK_ASSETS_ON_STARTUP: "true"
+      BABELDOC_OFFLINE_ASSET_PROFILE: full
+      UPLOAD_DIR: /app/uploads
+      OUTPUT_DIR: /app/outputs
+    volumes:
+      - backend_uploads:/app/uploads
+      - backend_outputs:/app/outputs
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    image: ghcr.io/ccsert/babeldoc-frontend:latest
+    pull_policy: never
+    container_name: ${COMPOSE_PROJECT_NAME:-babeldoc}-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${WEB_PORT:-80}:80"
+
+volumes:
+  postgres_data:
+  backend_uploads:
+  backend_outputs:
