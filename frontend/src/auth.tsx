@@ -57,8 +57,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
   };
 
+  const updateUser = (patch: Partial<Pick<User, 'email'>>) => {
+    setUser((prev) => (prev ? { ...prev, ...patch } : prev));
+  };
+
   return (
-    <AuthContext.Provider value={{ user, token, login, register, logout, isAdmin: user?.role === 'admin', loading }}>
+    <AuthContext.Provider value={{ user, token, login, register, logout, updateUser, isAdmin: user?.role === 'admin', loading }}>
       {children}
     </AuthContext.Provider>
   );

@@ -7,7 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.models import TaskStatus, TranslationTask, User
-from app.schemas.schemas import FileLibraryItemOut, FileLibraryListOut
+from app.schemas.schemas import (
+    FileLibraryDeleteRequest,
+    FileLibraryItemOut,
+    FileLibraryListOut,
+)
+from app.services.task_storage import purge_tasks
 
 router = APIRouter(prefix="/files", tags=["文件库"])
 
@@ -77,3 +82,43 @@ async def list_files(
 
     files = list(files_by_hash.values())
     return FileLibraryListOut(files=files, total=len(files))
+
+
+@router.delete("")
+async def delete_files(
+    data: FileLibraryDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """删除文件库条目：按 file_hash 删除当前用户名下该文件的全部已完成翻译记录，
+    物理文件在全局无其他任务引用时一并回收。无 file_hash 的旧任务以 legacy-<id> 表示。"""
+    real_hashes: list[str] = []
+    legacy_ids: list[int] = []
+    for raw in dict.fromkeys(data.file_hashes):
+        if raw.startswith("legacy-") and raw[len("legacy-"):].isdigit():
+            legacy_ids.append(int(raw[len("legacy-"):]))
+        else:
+            real_hashes.append(raw)
+
+    conditions = []
+    if real_hashes:
+        conditions.append(TranslationTask.file_hash.in_(real_hashes))
+    if legacy_ids:
+        conditions.append(TranslationTask.id.in_(legacy_ids))
+    if not conditions:
+        return {"detail": "没有可删除的记录", "deleted": 0}
+
+    result = await db.execute(
+        select(TranslationTask).where(
+            TranslationTask.user_id == current_user.id,
+            TranslationTask.status == TaskStatus.completed,
+            or_(
+                TranslationTask.output_mono_filename.is_not(None),
+                TranslationTask.output_dual_filename.is_not(None),
+            ),
+            or_(*conditions),
+        )
+    )
+    tasks = list(result.scalars().all())
+    deleted = await purge_tasks(db, tasks)
+    return {"detail": f"已删除 {deleted} 条翻译记录", "deleted": deleted}

@@ -6,8 +6,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import require_admin
+from app.core.security import get_password_hash
 from app.models.models import User, UserRole, TranslationTask, TaskStatus
-from app.schemas.schemas import UserOut, UserUpdate, TaskListOut
+from app.schemas.schemas import (
+    AdminPasswordReset,
+    AdminUserCreate,
+    UserOut,
+    UserUpdate,
+    TaskListOut,
+)
+from app.services.task_storage import purge_tasks
 from app.services.babeldoc_assets import get_latest_offline_assets_package_path
 from app.services.babeldoc_assets import get_offline_assets_export_status
 from app.services.babeldoc_assets import get_offline_assets_status
@@ -86,6 +94,44 @@ async def delete_user(user_id: int, db: AsyncSession = Depends(get_db)):
     return {"detail": "已删除"}
 
 
+@router.post("/users", response_model=UserOut, status_code=201)
+async def create_user(data: AdminUserCreate, db: AsyncSession = Depends(get_db)):
+    dup = (await db.execute(
+        select(User.id).where(
+            (User.username == data.username) | (User.email == data.email)
+        ).limit(1)
+    )).scalar_one_or_none()
+    if dup is not None:
+        raise HTTPException(status_code=400, detail="用户名或邮箱已存在")
+
+    role = UserRole.admin if data.role == "admin" else UserRole.user
+    user = User(
+        username=data.username,
+        email=data.email,
+        hashed_password=get_password_hash(data.password),
+        role=role,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+@router.post("/users/{user_id}/reset-password")
+async def reset_user_password(
+    user_id: int,
+    data: AdminPasswordReset,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    user.hashed_password = get_password_hash(data.new_password)
+    await db.commit()
+    return {"detail": "密码已重置"}
+
+
 # ─── Task management ─────────────────────────────────────
 
 @router.get("/tasks", response_model=TaskListOut)
@@ -122,6 +168,20 @@ async def cancel_task(task_id: int, db: AsyncSession = Depends(get_db)):
     task.status = TaskStatus.cancelled
     await db.commit()
     return {"detail": "已取消"}
+
+
+@router.delete("/tasks/{task_id}")
+async def delete_task(task_id: int, db: AsyncSession = Depends(get_db)):
+    """管理员可删除任意任务记录，但运行中/排队中的任务必须先取消再删，
+    否则 worker 进程会失配造成孤儿。"""
+    result = await db.execute(select(TranslationTask).where(TranslationTask.id == task_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.status in (TaskStatus.running, TaskStatus.queued, TaskStatus.pending):
+        raise HTTPException(status_code=400, detail="请先取消运行中的任务，再删除")
+    await purge_tasks(db, [task])
+    return {"detail": "已删除"}
 
 
 @router.get("/stats")

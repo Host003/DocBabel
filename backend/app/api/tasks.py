@@ -23,6 +23,7 @@ from sqlalchemy.orm import selectinload
 from app.models.models import User, TranslationTask, TaskStatus, GlossarySet, GlossaryEntry, CustomModel, UserRole
 from app.schemas.schemas import BatchDownloadRequest, BatchTaskCreateOut, TaskCreate, TaskOut, TaskListOut, GlossarySetOut
 from app.services.queue import translation_queue
+from app.services.task_storage import purge_tasks
 
 router = APIRouter(prefix="/tasks", tags=["翻译任务"])
 
@@ -402,27 +403,6 @@ def _normalize_date_param(value: str | None, end_of_day: bool = False) -> dateti
     return parsed
 
 
-async def _remove_file_if_orphan(db: AsyncSession, filename: str | None, base_dir: str, current_task_id: int):
-    if not filename:
-        return
-    ref_count = (
-        await db.execute(
-            select(func.count(TranslationTask.id)).where(
-                TranslationTask.id != current_task_id,
-                or_(
-                    TranslationTask.stored_filename == filename,
-                    TranslationTask.output_mono_filename == filename,
-                    TranslationTask.output_dual_filename == filename,
-                ),
-            )
-        )
-    ).scalar()
-    if ref_count == 0:
-        filepath = os.path.join(base_dir, filename)
-        if os.path.isfile(filepath):
-            os.remove(filepath)
-
-
 @router.post("", response_model=TaskOut, status_code=201)
 async def create_task(
     file: UploadFile = File(...),
@@ -740,17 +720,8 @@ async def delete_task(
     if task.status in (TaskStatus.running, TaskStatus.queued, TaskStatus.pending):
         raise HTTPException(status_code=400, detail="请先取消运行中的任务，再删除")
 
-    stored_filename = task.stored_filename
-    mono_filename = task.output_mono_filename
-    dual_filename = task.output_dual_filename
-
-    await db.delete(task)
-    await db.commit()
-
-    await _remove_file_if_orphan(db, stored_filename, settings.UPLOAD_DIR, task_id)
-    await _remove_file_if_orphan(db, mono_filename, settings.OUTPUT_DIR, task_id)
-    await _remove_file_if_orphan(db, dual_filename, settings.OUTPUT_DIR, task_id)
-    return {"detail": "已删除"}
+    deleted = await purge_tasks(db, [task])
+    return {"detail": "已删除", "deleted": deleted}
 
 
 class SaveGlossaryRequest(BaseModel):

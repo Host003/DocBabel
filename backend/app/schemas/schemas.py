@@ -39,6 +39,27 @@ class UserUpdate(BaseModel):
     role: str | None = None
 
 
+class AdminUserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    email: EmailStr
+    password: str = Field(min_length=6, max_length=128)
+    role: str = Field(default="user", pattern="^(admin|user)$")
+
+
+class AdminPasswordReset(BaseModel):
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class UpdateEmailRequest(BaseModel):
+    email: EmailStr
+    current_password: str
+
+
 # ─── Translation Task ────────────────────────────────────
 
 class TaskCreate(BaseModel):
@@ -143,6 +164,10 @@ class FileLibraryItemOut(BaseModel):
 class FileLibraryListOut(BaseModel):
     files: list[FileLibraryItemOut]
     total: int
+
+
+class FileLibraryDeleteRequest(BaseModel):
+    file_hashes: list[str] = Field(min_length=1, max_length=200)
 
 
 # ─── Glossary ────────────────────────────────────────────

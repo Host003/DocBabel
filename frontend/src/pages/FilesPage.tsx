@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { filesApi, tasksApi, type BatchFileType } from '../api';
-import { Archive, Calendar, Download, Eye, Search, CheckSquare, Square } from 'lucide-react';
+import { Archive, Calendar, Download, Eye, Search, CheckSquare, Square, Trash2 } from 'lucide-react';
 
 interface FileItem {
   file_hash: string;
@@ -153,6 +153,46 @@ export default function FilesPage() {
     }
   };
 
+  const [deletingHash, setDeletingHash] = useState<string | null>(null);
+  const [batchDeleting, setBatchDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
+
+  const selectedFileHashes = useMemo(
+    () => files.filter((f) => selectedTaskIds.has(f.latest_task_id)).map((f) => f.file_hash),
+    [files, selectedTaskIds],
+  );
+
+  const handleDeleteOne = async (fileHash: string, filename: string) => {
+    if (!confirm(`确定删除文件库中的「${filename}」？该文件的所有翻译记录和物理文件将被清除。`)) return;
+    setDeletingHash(fileHash);
+    setDeleteError('');
+    try {
+      await filesApi.delete([fileHash]);
+      setSelectedTaskIds(new Set());
+      await fetchFiles();
+    } catch (err: unknown) {
+      setDeleteError((err as { response?: { data?: { detail?: string } } }).response?.data?.detail || '删除失败');
+    } finally {
+      setDeletingHash(null);
+    }
+  };
+
+  const handleBatchDelete = async () => {
+    if (selectedFileHashes.length === 0) return;
+    if (!confirm(`确定删除选中的 ${selectedFileHashes.length} 个文件库条目？不可恢复。`)) return;
+    setBatchDeleting(true);
+    setDeleteError('');
+    try {
+      await filesApi.delete(selectedFileHashes);
+      setSelectedTaskIds(new Set());
+      await fetchFiles();
+    } catch (err: unknown) {
+      setDeleteError((err as { response?: { data?: { detail?: string } } }).response?.data?.detail || '批量删除失败');
+    } finally {
+      setBatchDeleting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
@@ -205,9 +245,12 @@ export default function FilesPage() {
             <button type="button" onClick={handleBatchDownload} disabled={selectedTaskIds.size === 0 || batchDownloading} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">
               {batchDownloading ? '打包中...' : `下载选中 ZIP (${selectedTaskIds.size})`}
             </button>
+            <button type="button" onClick={handleBatchDelete} disabled={selectedFileHashes.length === 0 || batchDeleting} className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-white px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 disabled:opacity-50">
+              <Trash2 className="h-4 w-4" />{batchDeleting ? '删除中...' : `删除选中 (${selectedFileHashes.length})`}
+            </button>
           </div>
         </div>
-        {batchError && <p className="mt-3 text-sm text-red-600">{batchError}</p>}
+        {(batchError || deleteError) && <p className="mt-3 text-sm text-red-600">{batchError || deleteError}</p>}
       </div>
 
       {loading ? (
@@ -263,6 +306,16 @@ export default function FilesPage() {
                       </button>
                     </div>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteOne(item.file_hash, item.original_filename)}
+                    disabled={deletingHash === item.file_hash}
+                    title="删除该文件库条目"
+                    aria-label="删除文件"
+                    className="rounded-lg border border-red-200 bg-white p-2 text-red-500 hover:bg-red-50 disabled:opacity-50"
+                  >
+                    <Trash2 className={`h-4 w-4 ${deletingHash === item.file_hash ? 'animate-pulse' : ''}`} />
+                  </button>
                 </div>
               </div>
             </div>

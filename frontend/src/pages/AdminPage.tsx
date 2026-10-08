@@ -16,6 +16,8 @@ import {
   XCircle,
   Shield,
   ShieldOff,
+  KeyRound,
+  UserPlus,
 } from 'lucide-react';
 
 interface Stats {
@@ -94,6 +96,14 @@ export default function AdminPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [taskTotal, setTaskTotal] = useState(0);
   const [taskPage, setTaskPage] = useState(1);
+
+  const [createUserOpen, setCreateUserOpen] = useState(false);
+  const [createUserLoading, setCreateUserLoading] = useState(false);
+  const [createUserError, setCreateUserError] = useState('');
+  const [resetFor, setResetFor] = useState<User | null>(null);
+  const [resetValue, setResetValue] = useState('');
+  const [resetLoading, setResetLoading] = useState(false);
+  const [resetError, setResetError] = useState('');
 
   const fetchStats = async () => {
     const res = await adminApi.stats();
@@ -199,9 +209,56 @@ export default function AdminPage() {
     fetchStats();
   };
 
+  const handleCreateUser = async (form: { username: string; email: string; password: string; role: string }) => {
+    setCreateUserLoading(true);
+    setCreateUserError('');
+    try {
+      await adminApi.createUser(form);
+      setCreateUserOpen(false);
+      fetchUsers();
+      fetchStats();
+    } catch (err: unknown) {
+      const detail = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail || '创建失败';
+      setCreateUserError(detail);
+    } finally {
+      setCreateUserLoading(false);
+    }
+  };
+
+  const handleResetPassword = async () => {
+    if (!resetFor) return;
+    if (resetValue.length < 6) {
+      setResetError('密码至少 6 位');
+      return;
+    }
+    setResetLoading(true);
+    setResetError('');
+    try {
+      await adminApi.resetUserPassword(resetFor.id, resetValue);
+      setResetFor(null);
+      setResetValue('');
+    } catch (err: unknown) {
+      const detail = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail || '重置失败';
+      setResetError(detail);
+    } finally {
+      setResetLoading(false);
+    }
+  };
+
   const cancelTask = async (id: number) => {
     await adminApi.cancelTask(id);
     fetchTasks();
+  };
+
+  const deleteTask = async (id: number) => {
+    if (!confirm('确定删除该任务记录？删除后无法恢复。')) return;
+    try {
+      await adminApi.deleteTask(id);
+      fetchTasks();
+      fetchStats();
+    } catch (err: unknown) {
+      alert((err as { response?: { data?: { detail?: string } } }).response?.data?.detail || '删除失败');
+    }
   };
 
   const checkOfflineAssets = async () => {
@@ -569,7 +626,17 @@ export default function AdminPage() {
 
       {/* Users */}
       {tab === 'users' && (
-        <div className="overflow-hidden rounded-xl bg-white ring-1 ring-gray-200">
+        <div className="space-y-4">
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={() => setCreateUserOpen(true)}
+              className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+            >
+              <UserPlus className="h-4 w-4" />创建用户
+            </button>
+          </div>
+          <div className="overflow-hidden rounded-xl bg-white ring-1 ring-gray-200">
           <table className="w-full text-sm">
             <thead className="bg-gray-50">
               <tr>
@@ -623,6 +690,15 @@ export default function AdminPage() {
                       </button>
                       <button
                         type="button"
+                        onClick={() => { setResetFor(u); setResetValue(''); setResetError(''); }}
+                        aria-label="重置密码"
+                        title="重置用户密码"
+                        className="rounded p-1.5 text-gray-400 hover:bg-amber-50 hover:text-amber-600"
+                      >
+                        <KeyRound className="h-4 w-4" />
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => deleteUser(u.id)}
                         aria-label="删除用户"
                         title="删除用户"
@@ -636,6 +712,7 @@ export default function AdminPage() {
               ))}
             </tbody>
           </table>
+          </div>
         </div>
       )}
 
@@ -676,14 +753,23 @@ export default function AdminPage() {
                     <td className="px-4 py-3 text-gray-500">{t.progress.toFixed(0)}%</td>
                     <td className="px-4 py-3 text-gray-500">{new Date(t.created_at).toLocaleString()}</td>
                     <td className="px-4 py-3 text-right">
-                      {['pending', 'queued', 'running'].includes(t.status) && (
-                        <button
-                          onClick={() => cancelTask(t.id)}
-                          className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50"
-                        >
-                          取消
-                        </button>
-                      )}
+                      <div className="flex items-center justify-end gap-1">
+                        {['pending', 'queued', 'running'].includes(t.status) ? (
+                          <button
+                            onClick={() => cancelTask(t.id)}
+                            className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50"
+                          >
+                            取消
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => deleteTask(t.id)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1 text-xs text-gray-600 hover:bg-red-50 hover:border-red-200 hover:text-red-600"
+                          >
+                            <Trash2 className="h-3 w-3" />删除
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -699,6 +785,138 @@ export default function AdminPage() {
           )}
         </div>
       )}
+
+      {/* 创建用户弹窗 */}
+      {createUserOpen && <CreateUserModal
+        loading={createUserLoading}
+        error={createUserError}
+        onClose={() => { setCreateUserOpen(false); setCreateUserError(''); }}
+        onSubmit={handleCreateUser}
+      />}
+
+      {/* 重置密码弹窗 */}
+      {resetFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="mx-4 w-full max-w-sm rounded-2xl bg-white shadow-xl">
+            <div className="flex items-center gap-3 border-b border-gray-100 px-6 py-4">
+              <KeyRound className="h-5 w-5 text-amber-500" />
+              <h2 className="text-base font-semibold text-gray-900">重置用户密码</h2>
+            </div>
+            <div className="space-y-4 px-6 py-4">
+              <p className="text-sm text-gray-600">为用户 <span className="font-semibold">{resetFor.username}</span>（{resetFor.email}）设置新密码。</p>
+              <input
+                type="password"
+                placeholder="新密码（至少 6 位）"
+                value={resetValue}
+                onChange={(e) => { setResetValue(e.target.value); setResetError(''); }}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                autoFocus
+              />
+              {resetError && <p className="text-sm text-red-500">{resetError}</p>}
+            </div>
+            <div className="flex justify-end gap-3 border-t border-gray-100 px-6 py-4">
+              <button
+                onClick={() => { setResetFor(null); setResetValue(''); setResetError(''); }}
+                disabled={resetLoading}
+                className="rounded-lg border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >取消</button>
+              <button
+                onClick={handleResetPassword}
+                disabled={resetLoading}
+                className="rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+              >{resetLoading ? '提交中...' : '确认重置'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface CreateUserModalProps {
+  loading: boolean;
+  error: string;
+  onClose: () => void;
+  onSubmit: (form: { username: string; email: string; password: string; role: string }) => Promise<void>;
+}
+
+function CreateUserModal({ loading, error, onClose, onSubmit }: CreateUserModalProps) {
+  const [username, setUsername] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState('user');
+  const [localError, setLocalError] = useState('');
+
+  const handle = async () => {
+    if (!username.trim() || !email.trim() || !password.trim()) {
+      setLocalError('所有字段必填');
+      return;
+    }
+    if (password.length < 6) {
+      setLocalError('密码至少 6 位');
+      return;
+    }
+    await onSubmit({ username: username.trim(), email: email.trim(), password, role });
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+      <div className="mx-4 w-full max-w-md rounded-2xl bg-white shadow-xl">
+        <div className="flex items-center gap-3 border-b border-gray-100 px-6 py-4">
+          <UserPlus className="h-5 w-5 text-blue-500" />
+          <h2 className="text-base font-semibold text-gray-900">创建新用户</h2>
+        </div>
+        <div className="space-y-3 px-6 py-4">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-gray-600">用户名</label>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              placeholder="3-64 个字符"
+              autoFocus
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-gray-600">邮箱</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-gray-600">初始密码</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              placeholder="至少 6 位"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-gray-600">角色</label>
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm"
+            >
+              <option value="user">普通用户</option>
+              <option value="admin">管理员</option>
+            </select>
+          </div>
+          {(error || localError) && <p className="text-sm text-red-500">{error || localError}</p>}
+        </div>
+        <div className="flex justify-end gap-3 border-t border-gray-100 px-6 py-4">
+          <button onClick={onClose} disabled={loading} className="rounded-lg border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50">取消</button>
+          <button onClick={handle} disabled={loading} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">
+            {loading ? '创建中...' : '创建'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

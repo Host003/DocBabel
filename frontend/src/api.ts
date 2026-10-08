@@ -66,6 +66,10 @@ export const authApi = {
   register: (username: string, email: string, password: string) =>
     api.post('/auth/register', { username, email, password }),
   me: () => api.get('/auth/me'),
+  changePassword: (current_password: string, new_password: string) =>
+    api.put('/auth/me/password', { current_password, new_password }),
+  changeEmail: (email: string, current_password: string) =>
+    api.put('/auth/me/email', { email, current_password }),
 };
 
 // ─── Tasks ───────────────────────────────────────────────
@@ -94,6 +98,8 @@ export const tasksApi = {
 export const filesApi = {
   list: (params?: { q?: string; start_date?: string; end_date?: string }) =>
     api.get('/files', { params }),
+  delete: (file_hashes: string[]) =>
+    api.delete('/files', { data: { file_hashes } }),
 };
 
 // ─── Glossaries ──────────────────────────────────────────
@@ -157,9 +163,14 @@ export const adminApi = {
   updateUser: (id: number, data: { email?: string; is_active?: boolean; role?: string }) =>
     api.patch(`/admin/users/${id}`, data),
   deleteUser: (id: number) => api.delete(`/admin/users/${id}`),
+  createUser: (data: { username: string; email: string; password: string; role?: string }) =>
+    api.post('/admin/users', data),
+  resetUserPassword: (id: number, new_password: string) =>
+    api.post(`/admin/users/${id}/reset-password`, { new_password }),
   listTasks: (params?: { status?: string; page?: number; page_size?: number }) =>
     api.get('/admin/tasks', { params }),
   cancelTask: (id: number) => api.post(`/admin/tasks/${id}/cancel`),
+  deleteTask: (id: number) => api.delete(`/admin/tasks/${id}`),
   offlineAssetsStatus: () => api.get('/admin/offline-assets/status'),
   checkOfflineAssets: () => api.post('/admin/offline-assets/check'),
   restoreOfflineAssets: () => api.post('/admin/offline-assets/restore'),

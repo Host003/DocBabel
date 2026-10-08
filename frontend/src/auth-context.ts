@@ -14,6 +14,7 @@ export interface AuthContextType {
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, email: string, password: string) => Promise<void>;
   logout: () => void;
+  updateUser: (patch: Partial<Pick<User, 'email'>>) => void;
   isAdmin: boolean;
   loading: boolean;
 }
