@@ -48,6 +48,8 @@ services:
     volumes:
       - backend_uploads:/app/uploads
       - backend_outputs:/app/outputs
+      # BabelDOC 运行时下载的字体/模型等资产（约 420MB），挂载到主机避免重建容器后重复下载
+      - ${BABELDOC_CACHE_DIR:-C:/Users/pc/.cache/babeldoc}:/root/.cache/babeldoc
     depends_on:
       postgres:
         condition: service_healthy
