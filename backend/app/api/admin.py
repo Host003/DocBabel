@@ -10,6 +10,7 @@ from app.core.security import get_password_hash
 from app.models.models import User, UserRole, TranslationTask, TaskStatus
 from app.schemas.schemas import (
     AdminPasswordReset,
+    AdminTaskBatchDeleteRequest,
     AdminUserCreate,
     UserOut,
     UserUpdate,
@@ -181,6 +182,33 @@ async def cancel_task(task_id: int, db: AsyncSession = Depends(get_db)):
     task.status = TaskStatus.cancelled
     await db.commit()
     return {"detail": "已取消"}
+
+
+@router.delete("/tasks")
+async def batch_delete_tasks(
+    data: AdminTaskBatchDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """管理员批量删除任务。运行中/排队/待处理的任务跳过，须先取消再删。"""
+    result = await db.execute(select(TranslationTask).where(TranslationTask.id.in_(data.task_ids)))
+    tasks = list(result.scalars().all())
+
+    found_ids = {t.id for t in tasks}
+    not_found = [tid for tid in data.task_ids if tid not in found_ids]
+    inflight_statuses = (TaskStatus.running, TaskStatus.queued, TaskStatus.pending)
+    deletable = [t for t in tasks if t.status not in inflight_statuses]
+    skipped_in_flight = [t.id for t in tasks if t.status in inflight_statuses]
+
+    if not deletable:
+        raise HTTPException(status_code=400, detail="选中的任务均在运行或排队中，请先取消再删除")
+
+    deleted = await purge_tasks(db, deletable)
+    return {
+        "detail": f"已删除 {deleted} 个任务",
+        "deleted": deleted,
+        "skipped_in_flight": skipped_in_flight,
+        "not_found": not_found,
+    }
 
 
 @router.delete("/tasks/{task_id}")

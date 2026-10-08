@@ -171,6 +171,10 @@ class FileLibraryDeleteRequest(BaseModel):
     file_hashes: list[str] = Field(min_length=1, max_length=200)
 
 
+class AdminTaskBatchDeleteRequest(BaseModel):
+    task_ids: list[int] = Field(min_length=1, max_length=200)
+
+
 # ─── Glossary ────────────────────────────────────────────
 
 class GlossaryEntryIn(BaseModel):

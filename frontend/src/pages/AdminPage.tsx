@@ -18,6 +18,8 @@ import {
   ShieldOff,
   KeyRound,
   UserPlus,
+  CheckSquare,
+  Square,
 } from 'lucide-react';
 
 interface Stats {
@@ -86,6 +88,8 @@ interface OfflineAssetsStatus {
   };
 }
 
+const INFLIGHT_STATUSES = ['pending', 'queued', 'running'];
+
 export default function AdminPage() {
   const [tab, setTab] = useState<'dashboard' | 'users' | 'tasks'>('dashboard');
   const [stats, setStats] = useState<Stats | null>(null);
@@ -97,6 +101,8 @@ export default function AdminPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [taskTotal, setTaskTotal] = useState(0);
   const [taskPage, setTaskPage] = useState(1);
+  const [selectedTaskIds, setSelectedTaskIds] = useState<Set<number>>(new Set());
+  const [batchDeleting, setBatchDeleting] = useState(false);
 
   const [createUserOpen, setCreateUserOpen] = useState(false);
   const [createUserLoading, setCreateUserLoading] = useState(false);
@@ -193,6 +199,11 @@ export default function AdminPage() {
     };
   }, [tab, taskPage]);
 
+  // 翻页或切换 Tab 时清空批量选择，避免选中集指向不可见的行
+  useEffect(() => {
+    setSelectedTaskIds(new Set());
+  }, [tab, taskPage]);
+
   const toggleUserActive = async (user: User) => {
     await adminApi.updateUser(user.id, { is_active: !user.is_active });
     fetchUsers();
@@ -255,10 +266,62 @@ export default function AdminPage() {
     if (!confirm('确定删除该任务记录？删除后无法恢复。')) return;
     try {
       await adminApi.deleteTask(id);
+      setSelectedTaskIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
       fetchTasks();
       fetchStats();
     } catch (err: unknown) {
       alert((err as { response?: { data?: { detail?: string } } }).response?.data?.detail || '删除失败');
+    }
+  };
+
+  const deletableTasks = tasks.filter((t) => !INFLIGHT_STATUSES.includes(t.status));
+  const deletableIdsOnPage = deletableTasks.map((t) => t.id);
+  const allOnPageSelected =
+    deletableIdsOnPage.length > 0 && deletableIdsOnPage.every((id) => selectedTaskIds.has(id));
+  const someOnPageSelected = deletableIdsOnPage.some((id) => selectedTaskIds.has(id));
+
+  const toggleTaskSelection = (id: number) => {
+    setSelectedTaskIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllOnPage = () => {
+    if (allOnPageSelected) {
+      setSelectedTaskIds((prev) => {
+        const next = new Set(prev);
+        deletableIdsOnPage.forEach((id) => next.delete(id));
+        return next;
+      });
+    } else {
+      setSelectedTaskIds((prev) => new Set([...prev, ...deletableIdsOnPage]));
+    }
+  };
+
+  const handleBatchDelete = async () => {
+    if (selectedTaskIds.size === 0 || batchDeleting) return;
+    if (!confirm(`确定删除选中的 ${selectedTaskIds.size} 个任务记录？删除后无法恢复。`)) return;
+    setBatchDeleting(true);
+    try {
+      const res = await adminApi.deleteTasks(Array.from(selectedTaskIds));
+      const skipped: number[] = res.data.skipped_in_flight ?? [];
+      setSelectedTaskIds(new Set(skipped));
+      await fetchTasks();
+      fetchStats();
+      if (skipped.length > 0) {
+        alert(`已删除 ${res.data.deleted} 个任务；#${skipped.join('、#')} 仍在运行/排队中，已跳过（请先取消）`);
+      }
+    } catch (err: unknown) {
+      alert((err as { response?: { data?: { detail?: string } } }).response?.data?.detail || '批量删除失败');
+    } finally {
+      setBatchDeleting(false);
     }
   };
 
@@ -720,10 +783,48 @@ export default function AdminPage() {
       {/* Tasks */}
       {tab === 'tasks' && (
         <div>
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={toggleSelectAllOnPage}
+              disabled={deletableIdsOnPage.length === 0}
+              className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-300 px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              <CheckSquare className="h-4 w-4" />{allOnPageSelected ? '取消全选当前页' : '全选当前页'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedTaskIds(new Set())}
+              disabled={selectedTaskIds.size === 0}
+              className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-300 px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              <Square className="h-4 w-4" />清空选择
+            </button>
+            <span className="text-sm text-gray-500">已选 {selectedTaskIds.size} 项（运行中任务需先取消才能选择）</span>
+            <button
+              type="button"
+              onClick={handleBatchDelete}
+              disabled={selectedTaskIds.size === 0 || batchDeleting}
+              className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-white px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
+            >
+              <Trash2 className="h-4 w-4" />{batchDeleting ? '删除中...' : `删除选中 (${selectedTaskIds.size})`}
+            </button>
+          </div>
           <div className="overflow-hidden rounded-xl bg-white ring-1 ring-gray-200">
             <table className="w-full text-sm">
               <thead className="bg-gray-50">
                 <tr>
+                  <th className="w-12 px-4 py-3">
+                    <input
+                      type="checkbox"
+                      checked={allOnPageSelected}
+                      ref={(el) => { if (el) el.indeterminate = !allOnPageSelected && someOnPageSelected; }}
+                      onChange={toggleSelectAllOnPage}
+                      disabled={deletableIdsOnPage.length === 0}
+                      title="全选/取消全选当前页可删除任务"
+                      className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                  </th>
                   <th className="px-4 py-3 text-left font-medium text-gray-700">ID</th>
                   <th className="px-4 py-3 text-left font-medium text-gray-700">文件名</th>
                   <th className="px-4 py-3 text-left font-medium text-gray-700">用户</th>
@@ -735,8 +836,20 @@ export default function AdminPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
-                {tasks.map((t) => (
+                {tasks.map((t) => {
+                  const inFlight = INFLIGHT_STATUSES.includes(t.status);
+                  return (
                   <tr key={t.id} className="hover:bg-gray-50">
+                    <td className="px-4 py-3">
+                      <input
+                        type="checkbox"
+                        checked={selectedTaskIds.has(t.id)}
+                        disabled={inFlight}
+                        onChange={() => toggleTaskSelection(t.id)}
+                        title={inFlight ? '运行/排队中的任务请先取消再选择' : '选择该任务'}
+                        className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-40"
+                      />
+                    </td>
                     <td className="px-4 py-3 text-gray-500">#{t.id}</td>
                     <td className="max-w-48 truncate px-4 py-3 font-medium text-gray-900">{t.original_filename}</td>
                     <td className="px-4 py-3 text-gray-900">{t.username ?? `#${t.user_id}`}</td>
@@ -755,7 +868,7 @@ export default function AdminPage() {
                     <td className="px-4 py-3 text-gray-500">{new Date(t.created_at).toLocaleString()}</td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex items-center justify-end gap-1">
-                        {['pending', 'queued', 'running'].includes(t.status) ? (
+                        {inFlight ? (
                           <button
                             onClick={() => cancelTask(t.id)}
                             className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50"
@@ -773,7 +886,8 @@ export default function AdminPage() {
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

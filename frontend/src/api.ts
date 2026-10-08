@@ -171,6 +171,7 @@ export const adminApi = {
     api.get('/admin/tasks', { params }),
   cancelTask: (id: number) => api.post(`/admin/tasks/${id}/cancel`),
   deleteTask: (id: number) => api.delete(`/admin/tasks/${id}`),
+  deleteTasks: (task_ids: number[]) => api.delete('/admin/tasks', { data: { task_ids } }),
   offlineAssetsStatus: () => api.get('/admin/offline-assets/status'),
   checkOfflineAssets: () => api.post('/admin/offline-assets/check'),
   restoreOfflineAssets: () => api.post('/admin/offline-assets/restore'),
