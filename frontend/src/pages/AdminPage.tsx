@@ -39,6 +39,7 @@ interface User {
 interface Task {
   id: number;
   user_id: number;
+  username?: string | null;
   status: string;
   original_filename: string;
   lang_in: string;
@@ -738,7 +739,7 @@ export default function AdminPage() {
                   <tr key={t.id} className="hover:bg-gray-50">
                     <td className="px-4 py-3 text-gray-500">#{t.id}</td>
                     <td className="max-w-48 truncate px-4 py-3 font-medium text-gray-900">{t.original_filename}</td>
-                    <td className="px-4 py-3 text-gray-500">{t.user_id}</td>
+                    <td className="px-4 py-3 text-gray-900">{t.username ?? `#${t.user_id}`}</td>
                     <td className="px-4 py-3 text-gray-500">{t.lang_in}→{t.lang_out}</td>
                     <td className="px-4 py-3">
                       <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${

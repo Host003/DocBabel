@@ -84,6 +84,7 @@ class TaskCreate(BaseModel):
 class TaskOut(BaseModel):
     id: int
     user_id: int
+    username: str | None = None
     status: str
     original_filename: str
     lang_in: str

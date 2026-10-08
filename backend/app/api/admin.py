@@ -14,6 +14,7 @@ from app.schemas.schemas import (
     UserOut,
     UserUpdate,
     TaskListOut,
+    TaskOut,
 )
 from app.services.task_storage import purge_tasks
 from app.services.babeldoc_assets import get_latest_offline_assets_package_path
@@ -154,7 +155,19 @@ async def list_all_tasks(
     query = query.order_by(TranslationTask.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
     result = await db.execute(query)
     tasks = list(result.scalars().all())
-    return {"tasks": tasks, "total": total}
+
+    # 批量查询用户名，避免管理列表只显示 user_id
+    user_ids = {t.user_id for t in tasks}
+    username_map: dict[int, str] = {}
+    if user_ids:
+        users_result = await db.execute(select(User.id, User.username).where(User.id.in_(user_ids)))
+        username_map = {uid: name for uid, name in users_result.all()}
+
+    task_payloads = [
+        {**TaskOut.model_validate(t).model_dump(), "username": username_map.get(t.user_id)}
+        for t in tasks
+    ]
+    return {"tasks": task_payloads, "total": total}
 
 
 @router.post("/tasks/{task_id}/cancel")
