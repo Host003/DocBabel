@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy import select, func
@@ -245,12 +247,14 @@ async def dashboard_stats(db: AsyncSession = Depends(get_db)):
 
 @router.get("/offline-assets/status")
 async def offline_assets_status():
-    return _build_offline_assets_response()
+    # 含资产状态读取（缓存失效时可能全量 SHA3），放线程避免阻塞事件循环。
+    return await asyncio.to_thread(_build_offline_assets_response)
 
 
 @router.post("/offline-assets/check")
 async def check_offline_assets():
-    return _build_offline_assets_response(force=True)
+    # 管理员手动强制全量校验（bind mount 上可能耗时数十秒），必须放线程执行。
+    return await asyncio.to_thread(_build_offline_assets_response, True)
 
 
 @router.post("/offline-assets/restore")
@@ -258,9 +262,10 @@ async def restore_configured_offline_assets():
     if not settings.BABELDOC_OFFLINE_ASSETS_PACKAGE:
         raise HTTPException(status_code=400, detail="未配置 BABELDOC_OFFLINE_ASSETS_PACKAGE")
     await restore_offline_assets_package(settings.BABELDOC_OFFLINE_ASSETS_PACKAGE)
+    refreshed = await asyncio.to_thread(_build_offline_assets_response, True)
     return {
         "detail": "离线资源包恢复完成",
-        **_build_offline_assets_response(force=True),
+        **refreshed,
     }
 
 
@@ -270,9 +275,10 @@ async def export_offline_assets():
         await start_offline_assets_export()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    status = await asyncio.to_thread(_build_offline_assets_response)
     return {
         "detail": "离线资源导出任务已启动",
-        **_build_offline_assets_response(),
+        **status,
     }
 
 

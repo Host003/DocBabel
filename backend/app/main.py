@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -7,9 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.database import init_db
-from app.services.babeldoc_assets import get_offline_assets_status
+from app.services.babeldoc_assets import get_cached_assets_status
 from app.services.babeldoc_assets import ensure_offline_assets_ready
 from app.services.babeldoc_assets import restore_offline_assets_package
+from app.services.babeldoc_assets import warm_assets_status_cache
 from app.services.queue import translation_queue
 from app.api import auth, tasks, glossaries, models, admin, files
 
@@ -26,7 +28,12 @@ async def lifespan(app: FastAPI):
     if settings.BABELDOC_OFFLINE_ASSETS_PACKAGE:
         await restore_offline_assets_package(settings.BABELDOC_OFFLINE_ASSETS_PACKAGE)
     if settings.BABELDOC_OFFLINE_MODE or settings.BABELDOC_PRECHECK_ASSETS_ON_STARTUP:
-        ensure_offline_assets_ready(force=True)
+        # 离线模式启动必须确认资产完整：在线程中全量校验（bind mount 上可能耗时数十秒），
+        # 既保证“校验通过才开始服务”，又不占用事件循环线程。
+        await asyncio.to_thread(ensure_offline_assets_ready, True)
+    else:
+        # 在线模式：后台线程预热资产状态缓存，不阻塞启动；/health 在此之前返回乐观快照。
+        asyncio.create_task(warm_assets_status_cache())
     await init_db()
     await translation_queue.start()
     yield
@@ -59,7 +66,9 @@ app.include_router(admin.router, prefix="/api")
 
 @app.get("/api/health")
 async def health():
-    assets_status = get_offline_assets_status()
+    # 高频健康检查（Docker healthcheck 默认每 10-30 秒）只读内存快照，
+    # 绝不在请求路径上对数百 MB 资产做 SHA3，否则会阻塞整个事件循环。
+    assets_status = get_cached_assets_status()
     return {
         "status": "ok",
         "babeldoc_offline_mode": settings.BABELDOC_OFFLINE_MODE,

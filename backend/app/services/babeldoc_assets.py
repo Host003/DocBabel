@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+import time
 import zipfile
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -18,8 +20,16 @@ from babeldoc.const import get_cache_file_path
 
 from app.core.config import settings
 
+logger = logging.getLogger(__name__)
+
 _OFFLINE_ASSETS_READY = False
 _OFFLINE_ASSETS_LOCK = threading.Lock()
+_OFFLINE_ASSETS_STATUS_CACHE: dict | None = None
+_OFFLINE_ASSETS_STATUS_CACHE_AT: float = 0.0
+# 资产校验需对 full 档约 420MB/182 个文件逐个做 SHA3；在 bind mount（尤其
+# Docker Desktop for Windows/macOS 的跨 VM 文件系统）上单次可达数十秒，
+# 因此非强制检查时在 TTL 内复用上次快照，禁止高频 /health 触发重复全量哈希。
+_OFFLINE_ASSETS_STATUS_TTL = 300.0
 _OFFLINE_ASSETS_EXPORT_LOCK = threading.Lock()
 _OFFLINE_ASSETS_EXPORT_TASK: asyncio.Task | None = None
 _OFFLINE_ASSETS_EXPORT_STATE = {
@@ -157,7 +167,7 @@ async def _run_offline_assets_export() -> None:
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _write_offline_assets_package, output_path)
-        get_offline_assets_status(force=True)
+        await loop.run_in_executor(None, get_offline_assets_status, True)
         _set_offline_assets_export_state(
             status="completed",
             step="completed",
@@ -234,59 +244,125 @@ class OfflineAssetsMissingError(RuntimeError):
         )
 
 
-def get_offline_assets_status(force: bool = False) -> dict:
-    """Return structured status for all BabelDOC runtime assets."""
+def _scan_assets_status(profile: str) -> dict:
+    """对当前 profile 的全部资产逐个 SHA3 校验（磁盘 IO 密集）。
+
+    调用方必须控制频率，并避免在 asyncio 事件循环线程直接执行（应放入线程池）。
+    """
+    file_list = get_profiled_asset_file_list(profile)
+    missing_files: list[str] = []
+    present_files = 0
+    by_type: dict[str, dict[str, object]] = {}
+
+    for file_type, file_descs in file_list.items():
+        total = len(file_descs)
+        type_missing: list[str] = []
+        type_present = 0
+
+        for file_desc in file_descs:
+            file_name = file_desc["name"]
+            sha3_256 = file_desc["sha3_256"]
+            file_path = get_cache_file_path(file_name, file_type)
+            file_key = f"{file_type}/{file_name}"
+            if verify_file(file_path, sha3_256):
+                present_files += 1
+                type_present += 1
+            else:
+                missing_files.append(file_key)
+                type_missing.append(file_name)
+
+        by_type[file_type] = {
+            "total": total,
+            "present": type_present,
+            "missing": total - type_present,
+            "ready": total == type_present,
+            "missing_files": type_missing,
+        }
+
+    total_files = sum(len(file_descs) for file_descs in file_list.values())
+    ready = not missing_files
+    return {
+        "profile": profile,
+        "profile_description": OFFLINE_ASSET_PROFILE_DESCRIPTIONS[profile],
+        "ready": ready,
+        "total_files": total_files,
+        "present_files": present_files,
+        "missing_files": len(missing_files),
+        "missing_file_paths": missing_files,
+        "by_type": by_type,
+        "checked": True,
+    }
+
+
+def get_offline_assets_status(force: bool = False, ttl: float = _OFFLINE_ASSETS_STATUS_TTL) -> dict:
+    """Return structured status for all BabelDOC runtime assets.
+
+    非 force 且缓存未超过 ttl 秒时直接返回内存快照；force=True 时无视缓存立即
+    重新扫描（管理端手动检查、资产包恢复/导出后刷新）。扫描持有全局锁串行执行。
+    """
     global _OFFLINE_ASSETS_READY
+    global _OFFLINE_ASSETS_STATUS_CACHE
+    global _OFFLINE_ASSETS_STATUS_CACHE_AT
 
     with _OFFLINE_ASSETS_LOCK:
+        now = time.monotonic()
+        if (
+            not force
+            and _OFFLINE_ASSETS_STATUS_CACHE is not None
+            and (now - _OFFLINE_ASSETS_STATUS_CACHE_AT) < ttl
+        ):
+            return deepcopy(_OFFLINE_ASSETS_STATUS_CACHE)
+
         if force:
             _OFFLINE_ASSETS_READY = False
 
         profile = get_offline_asset_profile()
+        snapshot = _scan_assets_status(profile)
+        _OFFLINE_ASSETS_READY = snapshot["ready"]
+        _OFFLINE_ASSETS_STATUS_CACHE = deepcopy(snapshot)
+        _OFFLINE_ASSETS_STATUS_CACHE_AT = now
+        return deepcopy(snapshot)
+
+
+def get_cached_assets_status() -> dict:
+    """高频健康检查专用：只返回内存快照，绝不做磁盘/网络 IO。
+
+    缓存尚未建立时（在线模式启动后台预热完成前）返回乐观快照——在线模式资产可
+    按需下载，健康检查不应因尚未校验而报告不健康；离线模式启动时会同步预检，
+    缓存必然已建立。
+    """
+    with _OFFLINE_ASSETS_LOCK:
+        if _OFFLINE_ASSETS_STATUS_CACHE is not None:
+            return deepcopy(_OFFLINE_ASSETS_STATUS_CACHE)
+
+    profile = get_offline_asset_profile()
+    try:
         file_list = get_profiled_asset_file_list(profile)
-        missing_files: list[str] = []
-        present_files = 0
-        by_type: dict[str, dict[str, object]] = {}
-
-        for file_type, file_descs in file_list.items():
-            total = len(file_descs)
-            type_missing: list[str] = []
-            type_present = 0
-
-            for file_desc in file_descs:
-                file_name = file_desc["name"]
-                sha3_256 = file_desc["sha3_256"]
-                file_path = get_cache_file_path(file_name, file_type)
-                file_key = f"{file_type}/{file_name}"
-                if verify_file(file_path, sha3_256):
-                    present_files += 1
-                    type_present += 1
-                else:
-                    missing_files.append(file_key)
-                    type_missing.append(file_name)
-
-            by_type[file_type] = {
-                "total": total,
-                "present": type_present,
-                "missing": total - type_present,
-                "ready": total == type_present,
-                "missing_files": type_missing,
-            }
-
         total_files = sum(len(file_descs) for file_descs in file_list.values())
-        ready = not missing_files
-        _OFFLINE_ASSETS_READY = ready
+    except Exception:
+        logger.exception("读取资产清单失败，健康检查返回未校验乐观快照")
+        total_files = 0
+    return {
+        "profile": profile,
+        "profile_description": OFFLINE_ASSET_PROFILE_DESCRIPTIONS[profile],
+        "ready": True,
+        "total_files": total_files,
+        "present_files": total_files,
+        "missing_files": 0,
+        "missing_file_paths": [],
+        "by_type": {},
+        "checked": False,
+    }
 
-        return {
-            "profile": profile,
-            "profile_description": OFFLINE_ASSET_PROFILE_DESCRIPTIONS[profile],
-            "ready": ready,
-            "total_files": total_files,
-            "present_files": present_files,
-            "missing_files": len(missing_files),
-            "missing_file_paths": missing_files,
-            "by_type": by_type,
-        }
+
+async def warm_assets_status_cache() -> None:
+    """在线模式启动后在后台线程执行一次资产校验以填充缓存，不阻塞启动与事件循环。"""
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, get_offline_assets_status, True)
+        logger.info("BabelDOC 资产状态后台预热完成")
+    except Exception:
+        logger.warning("BabelDOC 资产状态后台预热失败，健康检查将返回未校验快照", exc_info=True)
 
 
 def ensure_offline_assets_ready(force: bool = False) -> None:
@@ -311,4 +387,4 @@ async def restore_offline_assets_package(package_path: str) -> None:
     if not package.exists():
         raise RuntimeError(f"Configured offline assets package not found: {package}")
     await restore_offline_assets_package_async(package)
-    ensure_offline_assets_ready(force=True)
+    await asyncio.to_thread(ensure_offline_assets_ready, True)
