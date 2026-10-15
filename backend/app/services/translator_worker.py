@@ -262,6 +262,10 @@ def _do_translation(
     from babeldoc.format.pdf.translation_config import TranslationConfig, WatermarkOutputMode
     from babeldoc.progress_monitor import ProgressMonitor
 
+    from app.services.babeldoc_patches import apply_babeldoc_patches
+
+    apply_babeldoc_patches()
+
     def _progress_callback(**kwargs):
         event_type = kwargs.get("type")
         if event_type not in ("progress_update", "progress_end", "progress_start"):
