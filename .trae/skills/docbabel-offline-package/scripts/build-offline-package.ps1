@@ -19,7 +19,13 @@ param(
     [string]$RepoRoot,
     [ValidateSet("full", "core", "minimal")]
     [string]$Profile = "full",
-    [switch]$SkipZip
+    [switch]$SkipZip,
+    # 跳过镜像构建与资产烤入，直接复用本地现有 backend:latest 离线镜像。
+    # 仅当自上次离线构建以来 backend/ 与 frontend/ 代码零改动时使用
+    # （git diff --stat <上个离线 tag> HEAD -- backend frontend 为空），
+    # 例如只变更了根目录 scripts/、docs/ 等不进镜像的文件。脚本会校验
+    # latest 确为内置资产的离线镜像（BABELDOC_OFFLINE_MODE=true 且资产 182/182 就绪）。
+    [switch]$SkipImageBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,10 +74,18 @@ foreach ($d in @($Stage, "$Pkg\images", "$Pkg\src", "$Pkg\config")) {
 }
 
 # ── 4. 生成经 SHA3 校验的离线资产包 ──────────────────────────────────
-Write-Step "1/7 生成 BabelDOC 离线资产（逐个 SHA3 校验，约 1-3 分钟）"
 Push-Location (Join-Path $RepoRoot "backend")
 $env:PYTHONUTF8 = "1"
-$assetOut = & $Python -X utf8 -c @"
+if ($SkipImageBuild) {
+    # 复用现有离线镜像：只需计算资产标签（供 VERSION/README），不重写 223MB zip
+    Write-Step "1/7 计算离线资产标签（-SkipImageBuild，跳过资产生成与镜像构建）"
+    $assetOut = & $Python -X utf8 -c @"
+from babeldoc.assets.assets import generate_all_assets_file_list, get_offline_assets_tag
+print('ASSET_TAG=' + get_offline_assets_tag(generate_all_assets_file_list()))
+"@
+} else {
+    Write-Step "1/7 生成 BabelDOC 离线资产（逐个 SHA3 校验，约 1-3 分钟）"
+    $assetOut = & $Python -X utf8 -c @"
 from pathlib import Path
 from babeldoc.assets.assets import generate_all_assets_file_list, get_offline_assets_tag
 from app.services.babeldoc_assets import _write_offline_assets_package
@@ -80,6 +94,7 @@ _write_offline_assets_package(Path(r'$AssetZip'))
 print('ASSET_TAG=' + tag)
 print('ASSET_ZIP_BYTES=' + str(Path(r'$AssetZip').stat().st_size))
 "@
+}
 Pop-Location
 Assert-LastExit "离线资产生成失败（确认 $Python 已安装后端依赖且资产缓存完整，可先在联网环境预热）"
 $assetOut | ForEach-Object { Write-Host $_ }
@@ -87,15 +102,37 @@ $AssetTag = ([regex]::Match(($assetOut -join "`n"), 'ASSET_TAG=([0-9a-f]+)')).Gr
 if (-not $AssetTag) { throw "未能解析资产标签" }
 
 # ── 5. 构建内置资产的后端离线镜像 ────────────────────────────────────
-# 固定 :base 标签为“不含资产的普通后端镜像”：离线镜像始终 FROM :base，
-# 避免 latest 已指向离线镜像时重复烤入资产造成层叠加（体积膨胀）。
-# 从源码构建，层全部命中缓存时仅需数十秒，不会移动/依赖 latest 标签。
-Write-Step "2/7 确认基础镜像 :base（命中缓存时秒级完成）"
-docker build -t ghcr.io/ccsert/babeldoc-backend:base (Join-Path $RepoRoot "backend")
-Assert-LastExit "基础后端镜像构建失败（首次需联网拉取依赖，可先执行 docker compose build）"
+if ($SkipImageBuild) {
+    # 复用现有 latest 离线镜像：严格校验其身份，再补上本次版本 tag
+    Write-Step "2/7 校验现有 backend:latest 离线镜像（-SkipImageBuild）"
+    docker image inspect ghcr.io/ccsert/babeldoc-backend:latest | Out-Null
+    Assert-LastExit "本地不存在 ghcr.io/ccsert/babeldoc-backend:latest，无法 -SkipImageBuild（请去掉该参数完整构建）"
+    $checkOut = docker run --rm --entrypoint python3 ghcr.io/ccsert/babeldoc-backend:latest -c @"
+import os
+from app.services.babeldoc_assets import get_offline_assets_status
+s = get_offline_assets_status()
+print('OFFLINE_ENV=' + str(os.environ.get('BABELDOC_OFFLINE_MODE')))
+print('READY=' + str(s['ready']))
+print('FILES=%s/%s' % (s['present_files'], s['total_files']))
+"@
+    Assert-LastExit "校验 backend:latest 离线资产失败"
+    $checkOut | ForEach-Object { Write-Host "  $_" }
+    $checkText = $checkOut -join "`n"
+    if ($checkText -notmatch 'OFFLINE_ENV=true' -or $checkText -notmatch 'READY=True' -or $checkText -notmatch 'FILES=182/182') {
+        throw "backend:latest 不是完整的 full 离线镜像（期望 OFFLINE_ENV=true / READY=True / FILES=182/182），请去掉 -SkipImageBuild 完整构建"
+    }
+    docker tag ghcr.io/ccsert/babeldoc-backend:latest "ghcr.io/ccsert/babeldoc-backend:$Commit-offline"
+    Assert-LastExit "打 $Commit-offline 标签失败"
+} else {
+    # 固定 :base 标签为“不含资产的普通后端镜像”：离线镜像始终 FROM :base，
+    # 避免 latest 已指向离线镜像时重复烤入资产造成层叠加（体积膨胀）。
+    # 从源码构建，层全部命中缓存时仅需数十秒，不会移动/依赖 latest 标签。
+    Write-Step "2/7 确认基础镜像 :base（命中缓存时秒级完成）"
+    docker build -t ghcr.io/ccsert/babeldoc-backend:base (Join-Path $RepoRoot "backend")
+    Assert-LastExit "基础后端镜像构建失败（首次需联网拉取依赖，可先执行 docker compose build）"
 
-Write-Host "  -> 叠加离线资产层"
-$offlineDockerfile = @'
+    Write-Host "  -> 叠加离线资产层"
+    $offlineDockerfile = @'
 FROM ghcr.io/ccsert/babeldoc-backend:base
 COPY offline_assets.zip /tmp/offline_assets.zip
 RUN python3 -c "import zipfile,os; os.makedirs('/root/.cache/babeldoc', exist_ok=True); zipfile.ZipFile('/tmp/offline_assets.zip').extractall('/root/.cache/babeldoc')" \
@@ -104,9 +141,10 @@ ENV BABELDOC_OFFLINE_MODE=true
 ENV BABELDOC_OFFLINE_ASSET_PROFILE=__PROFILE__
 ENV BABELDOC_PRECHECK_ASSETS_ON_STARTUP=true
 '@ -replace "__PROFILE__", $Profile
-[IO.File]::WriteAllText((Join-Path $Stage "Dockerfile"), $offlineDockerfile.Replace("`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
-docker build -t "ghcr.io/ccsert/babeldoc-backend:$Commit-offline" -t "ghcr.io/ccsert/babeldoc-backend:latest" $Stage
-Assert-LastExit "离线后端镜像构建失败"
+    [IO.File]::WriteAllText((Join-Path $Stage "Dockerfile"), $offlineDockerfile.Replace("`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    docker build -t "ghcr.io/ccsert/babeldoc-backend:$Commit-offline" -t "ghcr.io/ccsert/babeldoc-backend:latest" $Stage
+    Assert-LastExit "离线后端镜像构建失败"
+}
 
 # ── 6. 导出 4 个镜像（PowerShell save + Git gzip；禁止 bash 管道）────
 Write-Step "3/7 导出镜像 tar.gz（后端约 1GB，耗时数分钟）"
