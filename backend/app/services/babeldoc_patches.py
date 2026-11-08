@@ -22,6 +22,14 @@ Patch C —— 提示词强化：
   在 il_translator / il_translator_llm_only 两个 PROMPT_TEMPLATE 中追加
   “不翻译命令行选项、路径、URL、版本号、文档编号、标识符；整段为代码时
   原样返回”的规则。采用锚点替换，锚点缺失（库升级）时仅告警不中断。
+
+Patch D —— 孤字行修复：
+  BabelDOC 的排版只在内容垂直溢出边界框时才缩小字号，从不检查末行字数。
+  中文译文比英文原文长，短标题（如 "Part 1" -> "第一部分"）断行后末行常常
+  只剩一个字，非常难看。包装 Typesetting.retypeset_with_precomputed_scale：
+  排版完成后检测末行非空白字符数，若为 1 则按 2% 步长逐步缩小该段字号
+  （不低于 ORPHAN_SCALE_FLOOR），取第一个“所有内容放得下且末行 >= 2 字”的
+  字号重新排版。含公式/图形单元的段落与目录条目不做处理，避免重复绘制。
 """
 
 import logging
@@ -63,6 +71,15 @@ _LIST_SPLIT_MIN_RATIO = 0.5
 _SENTENCE_FINAL_CHARS = (".", "?", "!")
 # 只对这些版面标签做列表拆分；表格单元格(fallback_line)、页眉页脚(abandon)等不动
 _LIST_SPLITTABLE_LABELS = {None, "plain text", "text", "paragraph_hybrid", "list"}
+
+# 孤字行修复（Patch D）
+ORPHAN_SCALE_STEP = 0.02
+ORPHAN_SCALE_FLOOR = 0.70
+ORPHAN_MAX_ATTEMPTS = 16
+ORPHAN_MIN_LAST_CHARS = 2
+_ORPHAN_Y_TOL = 0.1
+# 表格单元格、页眉页脚等不参与孤字修复（与原排版约束一致）
+_ORPHAN_SKIP_LABELS = {"fallback_line", "abandon"}
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +374,167 @@ def _make_patched_process_page(orig):
 
 
 # ---------------------------------------------------------------------------
+# Patch D：孤字行修复
+# ---------------------------------------------------------------------------
+
+
+def _last_line_non_space_count(entries) -> int:
+    """统计最后一行（y 最小的一行）的非空白字符数。
+
+    entries 为 (y, unicode_text) 序列；PDF 坐标向下递减，故最后一行的 y 最小。
+    """
+    items = [
+        (y, text)
+        for y, text in entries
+        if y is not None and (text or "").strip()
+    ]
+    if not items:
+        return 0
+    items.sort(key=lambda item: item[0])
+    base_y = items[0][0]
+    count = 0
+    for y, _text in items:
+        if abs(y - base_y) > _ORPHAN_Y_TOL:
+            break
+        count += 1
+    return count
+
+
+def _composition_line_entries(paragraph):
+    """从已排版的 composition 提取 (y, unicode)；含非纯字符组成时返回 None。"""
+    entries = []
+    for comp in paragraph.pdf_paragraph_composition or []:
+        char = comp.pdf_character
+        if char is None or char.box is None:
+            return None
+        entries.append((char.box.y, char.char_unicode))
+    return entries
+
+
+def _typeset_unit_line_entries(typeset_units):
+    """从排版单元提取 (y, unicode)；含公式单元时返回 None。"""
+    entries = []
+    for unit in typeset_units:
+        if unit.formular is not None:
+            return None
+        if unit.char is not None:
+            entries.append((unit.char.box.y, unit.char.char_unicode))
+        elif unit.unicode:
+            entries.append((unit.y, unit.unicode))
+    return entries
+
+
+def _fix_orphan_last_line(
+    typesetting,
+    paragraph,
+    page,
+    typesetting_units,
+    use_english_line_break: bool,
+) -> None:
+    """末行只剩一个字时缩小该段字号重排，直到末行至少 2 个字。
+
+    仅在段落本身无公式/图形单元、无目录页码钉入时处理；找不到可行字号则保持
+    原排版不动。
+    """
+    if getattr(paragraph, "vertical", False):
+        return
+    if getattr(paragraph, "toc_page_number", None):
+        return
+    if getattr(paragraph, "layout_label", None) in _ORPHAN_SKIP_LABELS:
+        return
+
+    entries = _composition_line_entries(paragraph)
+    if entries is None:
+        return
+    non_space_total = sum(1 for _y, text in entries if (text or "").strip())
+    if non_space_total < ORPHAN_MIN_LAST_CHARS:
+        return
+    if _last_line_non_space_count(entries) != 1:
+        return
+
+    base_scale = getattr(paragraph, "scale", None)
+    if base_scale is None or base_scale <= ORPHAN_SCALE_FLOOR:
+        return
+    if any(unit.formular is not None for unit in typesetting_units):
+        return  # 含公式单元，重排会重复绘制曲线/图形
+
+    line_skip = 1.50 if getattr(typesetting, "is_cjk", False) else 1.3
+    scale = base_scale - ORPHAN_SCALE_STEP
+    attempts = 0
+    while scale >= ORPHAN_SCALE_FLOOR and attempts < ORPHAN_MAX_ATTEMPTS:
+        attempts += 1
+        try:
+            layout_units, all_units_fit = typesetting._layout_typesetting_units(
+                typesetting_units,
+                paragraph.box,
+                scale,
+                line_skip,
+                paragraph,
+                use_english_line_break,
+            )
+        except Exception:
+            layout_units, all_units_fit = [], False
+        if all_units_fit:
+            layout_entries = _typeset_unit_line_entries(layout_units)
+            if (
+                layout_entries is not None
+                and _last_line_non_space_count(layout_entries)
+                >= ORPHAN_MIN_LAST_CHARS
+            ):
+                typesetting._find_optimal_scale_and_layout(
+                    paragraph,
+                    page,
+                    typesetting_units,
+                    scale,
+                    use_english_line_break,
+                    apply_layout=True,
+                )
+                logger.debug(
+                    "DocBabel patch D: fixed orphan last line of paragraph %s "
+                    "(scale %.2f -> %.2f)",
+                    getattr(paragraph, "debug_id", "?"),
+                    base_scale,
+                    scale,
+                )
+                return
+        scale -= ORPHAN_SCALE_STEP
+
+
+def _make_patched_retypeset(orig):
+    def patched(
+        self,
+        paragraph,
+        page,
+        typesetting_units,
+        precomputed_scale,
+        use_english_line_break=True,
+    ):
+        orig(
+            self,
+            paragraph,
+            page,
+            typesetting_units,
+            precomputed_scale,
+            use_english_line_break,
+        )
+        try:
+            _fix_orphan_last_line(
+                self,
+                paragraph,
+                page,
+                typesetting_units,
+                use_english_line_break,
+            )
+        except Exception:
+            logger.exception(
+                "DocBabel patch D failed on paragraph %s; keeping original layout",
+                getattr(paragraph, "debug_id", "?"),
+            )
+
+    return patched
+
+
+# ---------------------------------------------------------------------------
 # Patch C：提示词强化
 # ---------------------------------------------------------------------------
 
@@ -420,6 +598,7 @@ def apply_babeldoc_patches() -> None:
     from babeldoc.format.pdf.document_il.midend import il_translator
     from babeldoc.format.pdf.document_il.midend import il_translator_llm_only
     from babeldoc.format.pdf.document_il.midend import paragraph_finder
+    from babeldoc.format.pdf.document_il.midend import typesetting
 
     il_translator.ILTranslator.pre_translate_paragraph = (
         _make_patched_pre_translate_paragraph(
@@ -428,6 +607,9 @@ def apply_babeldoc_patches() -> None:
     )
     paragraph_finder.ParagraphFinder.process_page = _make_patched_process_page(
         paragraph_finder.ParagraphFinder.process_page
+    )
+    typesetting.Typesetting.retypeset_with_precomputed_scale = _make_patched_retypeset(
+        typesetting.Typesetting.retypeset_with_precomputed_scale
     )
     _patch_prompt_template(
         il_translator, _IL_RULES_ANCHOR, _IL_RULES_REPLACEMENT, "il_translator"
@@ -442,5 +624,6 @@ def apply_babeldoc_patches() -> None:
     _APPLIED = True
     logger.info(
         "DocBabel BabelDOC patches applied "
-        "(monospace/identifier skip, list splitting, prompt hardening)"
+        "(monospace/identifier skip, list splitting, prompt hardening, "
+        "orphan-line fix)"
     )
