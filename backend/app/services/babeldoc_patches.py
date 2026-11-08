@@ -27,9 +27,11 @@ Patch D —— 孤字行修复：
   BabelDOC 的排版只在内容垂直溢出边界框时才缩小字号，从不检查末行字数。
   中文译文比英文原文长，短标题（如 "Part 1" -> "第一部分"）断行后末行常常
   只剩一个字，非常难看。包装 Typesetting.retypeset_with_precomputed_scale：
-  排版完成后检测末行非空白字符数，若为 1 则按 2% 步长逐步缩小该段字号
-  （不低于 ORPHAN_SCALE_FLOOR），取第一个“所有内容放得下且末行 >= 2 字”的
-  字号重新排版。含公式/图形单元的段落与目录条目不做处理，避免重复绘制。
+  排版完成后检测末行非空白字符数，若为 1 则按 2% 步长逐步缩小该段字号，
+  取第一个“所有内容放得下且重排后末行 >= 2 字”的字号重新排版。
+  缩放下限为 max(ORPHAN_SCALE_FLOOR, base_scale * ORPHAN_RELATIVE_FLOOR)，
+  避免为凑行把字号缩得过小。含公式/图形单元的段落也参与修复：重排前先截断
+  第一次排版追加到页面的曲线/图形，重排后再重新追加，保证装饰只绘制一次。
 """
 
 import logging
@@ -74,12 +76,13 @@ _LIST_SPLITTABLE_LABELS = {None, "plain text", "text", "paragraph_hybrid", "list
 
 # 孤字行修复（Patch D）
 ORPHAN_SCALE_STEP = 0.02
-ORPHAN_SCALE_FLOOR = 0.70
+ORPHAN_SCALE_FLOOR = 0.55  # 绝对下限（原文已经很小的标题可能已缩到 0.65）
+ORPHAN_RELATIVE_FLOOR = 0.75  # 相对当前字号最多再缩 25%
 ORPHAN_MAX_ATTEMPTS = 16
 ORPHAN_MIN_LAST_CHARS = 2
 _ORPHAN_Y_TOL = 0.1
-# 表格单元格、页眉页脚等不参与孤字修复（与原排版约束一致）
-_ORPHAN_SKIP_LABELS = {"fallback_line", "abandon"}
+# 表格单元格不参与孤字修复；Part/章扉页横幅标题常被标为 abandon，需参与修复
+_ORPHAN_SKIP_LABELS = {"fallback_line"}
 
 
 # ---------------------------------------------------------------------------
@@ -383,11 +386,7 @@ def _last_line_non_space_count(entries) -> int:
 
     entries 为 (y, unicode_text) 序列；PDF 坐标向下递减，故最后一行的 y 最小。
     """
-    items = [
-        (y, text)
-        for y, text in entries
-        if y is not None and (text or "").strip()
-    ]
+    items = [(y, text) for y, text in entries if y is not None and (text or "").strip()]
     if not items:
         return 0
     items.sort(key=lambda item: item[0])
@@ -412,11 +411,14 @@ def _composition_line_entries(paragraph):
 
 
 def _typeset_unit_line_entries(typeset_units):
-    """从排版单元提取 (y, unicode)；含公式单元时返回 None。"""
+    """从排版单元提取 (y, unicode)；公式/图形单元按 1 个可见字符计。"""
     entries = []
     for unit in typeset_units:
         if unit.formular is not None:
-            return None
+            box = unit.box
+            if box is not None and box.y is not None:
+                entries.append((box.y, "\u2588"))
+            continue
         if unit.char is not None:
             entries.append((unit.char.box.y, unit.char.char_unicode))
         elif unit.unicode:
@@ -430,11 +432,14 @@ def _fix_orphan_last_line(
     page,
     typesetting_units,
     use_english_line_break: bool,
+    pdf_curve_len: int = 0,
+    pdf_form_len: int = 0,
 ) -> None:
     """末行只剩一个字时缩小该段字号重排，直到末行至少 2 个字。
 
-    仅在段落本身无公式/图形单元、无目录页码钉入时处理；找不到可行字号则保持
-    原排版不动。
+    缩放下限为 max(ORPHAN_SCALE_FLOOR, base_scale * ORPHAN_RELATIVE_FLOOR)，
+    找不到可行字号则保持原排版。重排前把第一次排版追加到页面的曲线/图形
+    截断（重排会重新追加），避免同一装饰被绘制两次。
     """
     if getattr(paragraph, "vertical", False):
         return
@@ -455,13 +460,12 @@ def _fix_orphan_last_line(
     base_scale = getattr(paragraph, "scale", None)
     if base_scale is None or base_scale <= ORPHAN_SCALE_FLOOR:
         return
-    if any(unit.formular is not None for unit in typesetting_units):
-        return  # 含公式单元，重排会重复绘制曲线/图形
 
     line_skip = 1.50 if getattr(typesetting, "is_cjk", False) else 1.3
-    scale = base_scale - ORPHAN_SCALE_STEP
+    min_scale = max(ORPHAN_SCALE_FLOOR, base_scale * ORPHAN_RELATIVE_FLOOR)
+    scale = round(base_scale - ORPHAN_SCALE_STEP, 4)
     attempts = 0
-    while scale >= ORPHAN_SCALE_FLOOR and attempts < ORPHAN_MAX_ATTEMPTS:
+    while scale >= min_scale and attempts < ORPHAN_MAX_ATTEMPTS:
         attempts += 1
         try:
             layout_units, all_units_fit = typesetting._layout_typesetting_units(
@@ -478,9 +482,13 @@ def _fix_orphan_last_line(
             layout_entries = _typeset_unit_line_entries(layout_units)
             if (
                 layout_entries is not None
-                and _last_line_non_space_count(layout_entries)
-                >= ORPHAN_MIN_LAST_CHARS
+                and _last_line_non_space_count(layout_entries) >= ORPHAN_MIN_LAST_CHARS
             ):
+                if page is not None:
+                    if page.pdf_curve is not None:
+                        del page.pdf_curve[pdf_curve_len:]
+                    if page.pdf_form is not None:
+                        del page.pdf_form[pdf_form_len:]
                 typesetting._find_optimal_scale_and_layout(
                     paragraph,
                     page,
@@ -489,15 +497,21 @@ def _fix_orphan_last_line(
                     use_english_line_break,
                     apply_layout=True,
                 )
-                logger.debug(
-                    "DocBabel patch D: fixed orphan last line of paragraph %s "
-                    "(scale %.2f -> %.2f)",
-                    getattr(paragraph, "debug_id", "?"),
-                    base_scale,
-                    scale,
-                )
-                return
-        scale -= ORPHAN_SCALE_STEP
+                applied_entries = _composition_line_entries(paragraph)
+                if (
+                    applied_entries is not None
+                    and _last_line_non_space_count(applied_entries)
+                    >= ORPHAN_MIN_LAST_CHARS
+                ):
+                    logger.debug(
+                        "DocBabel patch D: fixed orphan last line of paragraph %s "
+                        "(scale %.3f -> %.3f)",
+                        getattr(paragraph, "debug_id", "?"),
+                        base_scale,
+                        scale,
+                    )
+                    return
+        scale = round(scale - ORPHAN_SCALE_STEP, 4)
 
 
 def _make_patched_retypeset(orig):
@@ -509,6 +523,8 @@ def _make_patched_retypeset(orig):
         precomputed_scale,
         use_english_line_break=True,
     ):
+        curve_len = len(page.pdf_curve) if page.pdf_curve is not None else 0
+        form_len = len(page.pdf_form) if page.pdf_form is not None else 0
         orig(
             self,
             paragraph,
@@ -524,6 +540,8 @@ def _make_patched_retypeset(orig):
                 page,
                 typesetting_units,
                 use_english_line_break,
+                curve_len,
+                form_len,
             )
         except Exception:
             logger.exception(
