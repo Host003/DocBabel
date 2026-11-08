@@ -15,8 +15,12 @@ Patch A —— 代码/选项/标识符不送翻译：
 Patch B —— 列表项 / 索引 / 扉页标题拆分：
   包装 ParagraphFinder.process_page：原版分段完成后，把多条语义行被合并成
   一个段落的情况按视觉行重新拆开：
-  1. 列表项：>=2 行以列表标记（•/-/*/1./1.1/a./1 等）开头且标记行占比过半；
-     另有定义列表辅助规则（行首等宽字体且上一行以句末标点结尾）。
+  1. 列表项：标记行占比过半（每行一条），或明确 bullet 字形（私用区
+     Wingdings 符号 \uf0a1、■•◦ 等）的标记行虽少但每条都紧跟在已收尾的
+     上一条目之后（一条 bullet 折成 3~6 行的常见版式）；标记含
+     •/-/*/1./1.1/a./1 等；另有定义列表辅助规则（行首等宽字体且上一行
+     以句末标点结尾）。编号/引号/续行符等弱信号仍要求标记行占比过半，
+     避免把代码块、终端输出、普通正文切碎。
   2. index/索引词条：>=3 行、多数行以页码结尾（23 / 133–136 / 5, 14, 130）
      时，按“行尾页码”切分成一条词条一个段落；无页码的折行并入前一条。
   3. 大字号多行标题（Part/附录扉页横幅，行高 >= 18pt）：每行独立成段，
@@ -73,7 +77,22 @@ _LIST_MARKER_RE = re.compile(
     r")"
 )
 _LIST_SPLIT_MIN_MARKERS = 2
+# 紧排列表（每行一条）的标记行占比下限
 _LIST_SPLIT_MIN_RATIO = 0.5
+# 折行列表（一条 bullet 常占 3~6 行）中，标记行占比通常远低于 50%。
+# 此时改用“条目收尾”判据：上一条目以句末标点/冒号收尾，标记紧接其后；
+# 最多允许这么多条标记没有可靠的前置收尾（首条可直接接在引导句后）。
+_LIST_SPLIT_CONFIRM_TOLERANCE = 1
+# PDF 符号字体（Wingdings/Webdings/Symbol）把项目符号映射到私用区
+# U+E000–U+F8FF（曼宁书籍的小方块提取为 \uf0a1），肉眼不可见但确实在行首
+_PUA_BULLET_RE = re.compile(r"^\s*[\ue000-\uf8ff](?=[\s\w])")
+# 明确的 bullet 字形：只有它们才允许走“折行列表”判据。其他行首符号
+# （➥ 续行符、ANSI 转义、引号、括号、编号等）可能是正文/代码，必须要求
+# 标记行占比过半才拆，避免把普通段落切碎
+_STRONG_BULLET_RE = re.compile(
+    r"^\s*(?:[■•⚫⬤◆◇○●◦‣⁃▪▫∗]|[\ue000-\uf8ff])(?=[\s\u00a0]|\w)"
+)
+_ITEM_END_CHARS = (".", "?", "!", ":", "。", "！", "？", "：")
 # 曼宁书籍常用 "1 xxx" 这种无点号的编号列表
 _NUMBER_LIST_MARKER_RE = re.compile(r"^\s*\d{1,2}(?=[\s\u00a0]\S)")
 
@@ -280,35 +299,57 @@ def _maybe_split_list_paragraph(finder, paragraph, font_map):
         for line in lines
     ]
     marker_flags = [
-        bool(_LIST_MARKER_RE.match(text) or _NUMBER_LIST_MARKER_RE.match(text))
+        bool(
+            _LIST_MARKER_RE.match(text)
+            or _NUMBER_LIST_MARKER_RE.match(text)
+            or _PUA_BULLET_RE.match(text)
+        )
         if text
         else False
         for text in texts
     ]
-    marker_count = sum(marker_flags)
 
-    boundaries: set[int] = set()
-    if (
-        marker_count >= _LIST_SPLIT_MIN_MARKERS
-        and marker_count / len(lines) >= _LIST_SPLIT_MIN_RATIO
-    ):
-        boundaries.update(i for i, flag in enumerate(marker_flags) if flag)
-
-    # 兜底：>=2 行以同一个非字母数字符号开头（覆盖未知 bullet glyph）
-    if not boundaries:
+    # 兜底：主标记不足时才启用（覆盖未知 bullet glyph）。只取重复次数最多的
+    # 首字符，避免把行首引号等其他符号误判成条目边界
+    if sum(marker_flags) < _LIST_SPLIT_MIN_MARKERS:
         lead_counts: dict[str, int] = {}
         for text in texts:
             if text and not text[0].isalnum():
                 lead_counts[text[0]] = lead_counts.get(text[0], 0) + 1
-        for char, count in lead_counts.items():
-            if (
-                count >= _LIST_SPLIT_MIN_MARKERS
-                and count / len(lines) >= _LIST_SPLIT_MIN_RATIO
-            ):
-                boundaries.update(
-                    i for i, text in enumerate(texts) if text.startswith(char)
-                )
-                break
+        candidates = [
+            char
+            for char, count in lead_counts.items()
+            if count >= _LIST_SPLIT_MIN_MARKERS
+        ]
+        if candidates:
+            lead = max(candidates, key=lambda char: lead_counts[char])
+            for i, text in enumerate(texts):
+                if text.startswith(lead):
+                    marker_flags[i] = True
+
+    marker_indices = [i for i, flag in enumerate(marker_flags) if flag]
+    marker_count = len(marker_indices)
+
+    boundaries: set[int] = set()
+    if marker_count >= _LIST_SPLIT_MIN_MARKERS:
+        # 紧排列表：标记行占比过半（每行一条）
+        tight = marker_count / len(lines) >= _LIST_SPLIT_MIN_RATIO
+        # 折行列表：条目内部会换行，标记行只是少数。仅对明确的 bullet 字形
+        # 使用“上一条目已收尾”判据；编号/符号/未知 glyph 仍要求紧排，
+        # 否则会把代码块、终端输出、正文引号行切碎
+        strong_count = sum(
+            1 for text in texts if text and _STRONG_BULLET_RE.match(text)
+        )
+        unconfirmed = sum(
+            1
+            for i in marker_indices
+            if i > 0 and not texts[i - 1].endswith(_ITEM_END_CHARS)
+        )
+        if tight or (
+            strong_count >= _LIST_SPLIT_MIN_MARKERS
+            and unconfirmed <= _LIST_SPLIT_CONFIRM_TOLERANCE
+        ):
+            boundaries.update(marker_indices)
 
     # 定义列表辅助规则：行首等宽字体 + 上一行以句末标点结尾
     for i in range(1, len(lines)):
