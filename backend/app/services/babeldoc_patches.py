@@ -43,6 +43,7 @@ Patch D —— 孤字行修复：
 """
 
 import logging
+import os
 import re
 from string import Template
 
@@ -92,9 +93,31 @@ _PUA_BULLET_RE = re.compile(r"^\s*[\ue000-\uf8ff](?=[\s\w])")
 _STRONG_BULLET_RE = re.compile(
     r"^\s*(?:[■•⚫⬤◆◇○●◦‣⁃▪▫∗]|[\ue000-\uf8ff])(?=[\s\u00a0]|\w)"
 )
-_ITEM_END_CHARS = (".", "?", "!", ":", "。", "！", "？", "：")
+# 条目收尾判据：句末标点 + 右引号（条目以 …?” / …。” 结尾时右引号是最后字符）
+_ITEM_END_CHARS = (
+    ".", "?", "!", ":", "。", "！", "？", "：",
+    "”", "’", '"', "'",
+)
 # 曼宁书籍常用 "1 xxx" 这种无点号的编号列表
 _NUMBER_LIST_MARKER_RE = re.compile(r"^\s*\d{1,2}(?=[\s\u00a0]\S)")
+# 对话/标签行："Q:"/"A:"/"3:"/"Abra:"（LLM 问答实录、分类结果块）
+_LABEL_LINE_RE = re.compile(
+    r"^\s*(?:[A-Z]{1,3}|[A-Z][A-Za-z]{1,19}|\d{1,2}):(?=[\s\u00a0]\S)"
+)
+_LABEL_SPLIT_MIN = 4
+_LABEL_SPLIT_MIN_RATIO = 0.5
+# 全大写栏目标签行："PERSONA ..."/"OUTPUT FORMAT ..."（提示词结构块）
+_CAPS_LABEL_RE = re.compile(r"^\s*[A-Z]{2,}(?:\s+[A-Z]{2,})?(?=[\s\u00a0]+[A-Z])")
+_CAPS_LABEL_SPLIT_MIN = 3
+# 顺序编号步骤："1 ..."/"2 ..."/"3 ..." 严格 +1 递增即判定为步骤列表
+_SEQ_NUM_RE = re.compile(r"^\s*(\d{1,2})[.)]?(?=[\s\u00a0]\S)")
+_SEQ_NUM_SPLIT_MIN = 3
+# 纵向稀疏段落（页边旁注/批注）：行普遍很短且行间距离不均匀，
+# 按行距聚类拆分，使每条旁注独立翻译排版、不压到相邻代码
+_SCATTER_MIN_LINES = 6
+_SCATTER_MAX_MEDIAN_CHARS = 40
+_SCATTER_GAP_FACTOR = 2.0
+_SCATTER_MIN_GROUPS = 3
 
 # index/索引词条段落：多行被合并成一个 PdfParagraph 时按词条拆开。
 # 词条行特征是行尾页码：23 / 133–136 / 5, 14, 130, 185, 229
@@ -360,6 +383,53 @@ def _maybe_split_list_paragraph(finder, paragraph, font_map):
         ):
             boundaries.add(i)
 
+    # 对话/标签行块（LLM 问答实录 "Q:/A:/3:/Abra:"）：标签行过半即逐条拆开
+    label_indices = [
+        i for i, text in enumerate(texts) if text and _LABEL_LINE_RE.match(text)
+    ]
+    if (
+        len(label_indices) >= _LABEL_SPLIT_MIN
+        and len(label_indices) / len(lines) >= _LABEL_SPLIT_MIN_RATIO
+    ):
+        boundaries.update(label_indices)
+
+    # 全大写栏目标签块（PERSONA/CONTEXT/INSTRUCTION + 配套 bullet）。
+    # 等宽字体占比高的段落（SQL/代码里也有全大写关键字）不适用
+    caps_indices = [
+        i for i, text in enumerate(texts) if text and _CAPS_LABEL_RE.match(text)
+    ]
+    if len(caps_indices) >= _CAPS_LABEL_SPLIT_MIN and _mono_ratio(
+        paragraph, font_map
+    ) < 0.4:
+        boundaries.update(caps_indices)
+        boundaries.update(
+            i
+            for i, text in enumerate(texts)
+            if text and _STRONG_BULLET_RE.match(text)
+        )
+
+    # 顺序编号步骤（"1 ..."/"2 ..."/"3 ..." 严格递增）：
+    # 安装/操作步骤每步常折行且行间是命令行输出，
+    # “条目收尾”判据不适用，改用编号本身严格 +1 递增作判据
+    seq_pairs = []
+    for i, text in enumerate(texts):
+        if not text:
+            continue
+        match = _SEQ_NUM_RE.match(text)
+        if match:
+            seq_pairs.append((i, int(match.group(1))))
+    if len(seq_pairs) >= _SEQ_NUM_SPLIT_MIN:
+        run = [seq_pairs[0]]
+        for pair in seq_pairs[1:]:
+            if pair[1] == run[-1][1] + 1:
+                run.append(pair)
+            else:
+                if len(run) >= _SEQ_NUM_SPLIT_MIN:
+                    break
+                run = [pair]
+        if len(run) >= _SEQ_NUM_SPLIT_MIN and run[0][1] == 1:
+            boundaries.update(i for i, _num in run)
+
     boundaries.discard(0)
     if not boundaries:
         return None
@@ -510,6 +580,58 @@ def _maybe_split_heading_paragraph(finder, paragraph):
     )
 
 
+def _line_y_center(line):
+    ys = []
+    for char in line.pdf_character:
+        box = getattr(char, "box", None)
+        if box is None:
+            continue
+        ys.append((box.y + box.y2) / 2)
+    return (sum(ys) / len(ys)) if ys else None
+
+
+def _maybe_split_scattered_paragraph(finder, paragraph):
+    """页边旁注/批注段落：多条互不相干的短注被合并成一个纵向稀疏段落时，
+    按行距聚类拆开，避免翻译后整体重排压到相邻代码/正文。"""
+    from babeldoc.format.pdf.document_il.utils.layout_helper import (
+        get_char_unicode_string,
+    )
+
+    if paragraph.layout_label not in _LIST_SPLITTABLE_LABELS:
+        return None
+    if getattr(paragraph, "vertical", False):
+        return None
+    lines = _get_visual_lines(finder, paragraph)
+    if not lines or len(lines) < _SCATTER_MIN_LINES:
+        return None
+
+    texts = [
+        (get_char_unicode_string(line.pdf_character) or "").strip()
+        for line in lines
+    ]
+    lengths = sorted(len(text) for text in texts if text)
+    if not lengths or lengths[len(lengths) // 2] > _SCATTER_MAX_MEDIAN_CHARS:
+        return None
+
+    centers = [_line_y_center(line) for line in lines]
+    if any(center is None for center in centers):
+        return None
+    gaps = [abs(centers[i] - centers[i - 1]) for i in range(1, len(lines))]
+    median_gap = sorted(gaps)[len(gaps) // 2]
+    if median_gap <= 0:
+        return None
+
+    groups = [[lines[0]]]
+    for i in range(1, len(lines)):
+        if gaps[i - 1] > median_gap * _SCATTER_GAP_FACTOR:
+            groups.append([lines[i]])
+        else:
+            groups[-1].append(lines[i])
+    if len(groups) < _SCATTER_MIN_GROUPS:
+        return None
+    return _build_split_paragraphs(finder, paragraph, groups, "scattered")
+
+
 def _split_list_paragraphs(finder, page) -> None:
     font_map = {font.font_id: font for font in page.pdf_font or []}
     for xobj in page.pdf_xobject or []:
@@ -523,6 +645,8 @@ def _split_list_paragraphs(finder, page) -> None:
             split = _maybe_split_index_paragraph(finder, paragraph)
         if not split:
             split = _maybe_split_heading_paragraph(finder, paragraph)
+        if not split:
+            split = _maybe_split_scattered_paragraph(finder, paragraph)
         if split:
             new_paragraphs.extend(split)
         else:
@@ -726,6 +850,116 @@ def _make_patched_retypeset(orig):
 
 
 # ---------------------------------------------------------------------------
+# Patch E：LLM 空译文防护 + max_tokens 提升
+#
+# 实测 deepseek-flash（推理模型）在 BabelDOC 硬编码 max_tokens=2048 下，
+# reasoning_tokens 会耗尽全部输出预算，content 返回空串（finish_reason=length）。
+# BabelDOC 原逻辑把空串直接写进缓存并应用到段落，导致整段内容从产物中消失。
+# 三层防护：
+#   1. 包装 OpenAI client.chat.completions.create：max_tokens 提升到
+#      DOCBABEL_LLM_MAX_TOKENS（默认 8192），响应 content 为空时抛异常，
+#      让 BabelDOC 走“保留原文/逐段重试”路径而不是把空串写进段落；
+#   2. TranslationCache.set：拒绝写入空译文；
+#   3. TranslationCache.get：命中空译文视为未命中并尽力删除该脏行，
+#      使历史任务留下的空缓存自动修复。
+# ---------------------------------------------------------------------------
+
+LLM_MAX_TOKENS = int(os.environ.get("DOCBABEL_LLM_MAX_TOKENS", "8192"))
+
+
+class EmptyLLMTranslationError(RuntimeError):
+    """LLM 返回空译文（推理预算耗尽或提供商异常）。"""
+
+
+def _wrap_openai_client_create(translator) -> None:
+    client = getattr(translator, "client", None)
+    chat = getattr(client, "chat", None)
+    completions = getattr(chat, "completions", None)
+    if completions is None:
+        return
+    create = completions.create
+    if getattr(create, "_docbabel_guarded", False):
+        return
+
+    def guarded_create(*args, **kwargs):
+        max_tokens = kwargs.get("max_tokens")
+        if max_tokens is not None and max_tokens < LLM_MAX_TOKENS:
+            kwargs["max_tokens"] = LLM_MAX_TOKENS
+        response = create(*args, **kwargs)
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError, TypeError):
+            content = None
+        if content is not None and not content.strip():
+            finish = None
+            try:
+                finish = response.choices[0].finish_reason
+            except (AttributeError, IndexError, TypeError):
+                pass
+            raise EmptyLLMTranslationError(
+                f"LLM returned empty content (finish_reason={finish}); "
+                "treat as translation failure"
+            )
+        return response
+
+    guarded_create._docbabel_guarded = True
+    completions.create = guarded_create
+
+
+def _make_patched_openai_init(orig):
+    def patched(self, *args, **kwargs):
+        orig(self, *args, **kwargs)
+        try:
+            _wrap_openai_client_create(self)
+        except Exception:
+            logger.exception("DocBabel patch E: wrap openai client failed")
+
+    return patched
+
+
+def _make_patched_cache_set(orig):
+    def patched(self, original_text, translation):
+        if translation is None or not str(translation).strip():
+            logger.warning(
+                "DocBabel patch E: refuse to cache empty translation "
+                "(%d chars source)",
+                len(original_text or ""),
+            )
+            return
+        return orig(self, original_text, translation)
+
+    return patched
+
+
+def _make_patched_cache_get(orig):
+    def patched(self, original_text):
+        result = orig(self, original_text)
+        if result is not None and not str(result).strip():
+            logger.warning(
+                "DocBabel patch E: drop cached empty translation, re-translate "
+                "(%d chars source)",
+                len(original_text or ""),
+            )
+            try:
+                from babeldoc.translator import cache as _cache_module
+
+                _cache_module._TranslationCache.delete().where(
+                    (_cache_module._TranslationCache.translate_engine
+                     == self.translate_engine)
+                    & (_cache_module._TranslationCache.translate_engine_params
+                       == self.translate_engine_params)
+                    & (_cache_module._TranslationCache.original_text
+                       == original_text)
+                ).execute()
+            except Exception:
+                logger.debug("DocBabel patch E: delete empty cache row failed")
+            return None
+        return result
+
+    return patched
+
+
+# ---------------------------------------------------------------------------
 # Patch C：提示词强化
 # ---------------------------------------------------------------------------
 
@@ -741,7 +975,10 @@ _IL_RULES_REPLACEMENT = (
     "unchanged.\n"
     "6. If the entire input is source code, a shell/command line, or "
     "configuration syntax, return it exactly unchanged.\n"
-    "7. Translate ALL human-readable content into $lang_out."
+    "7. XML/HTML-like tags (e.g., <Persona>, </Context>, <Tone>) are "
+    "markup: keep every tag name and the angle brackets exactly unchanged "
+    "and correctly paired; translate only the text between tags.\n"
+    "8. Translate ALL human-readable content into $lang_out."
 )
 
 _LLM_RULES_ANCHOR = (
@@ -755,6 +992,10 @@ _LLM_RULES_REPLACEMENT = (
     "- Command-line options/flags (e.g., -C, --target=..., -mcpu=...), file "
     "paths, URLs, version numbers, document/part numbers, and programming "
     "identifiers: keep exactly unchanged.\n"
+    "- XML/HTML-like tags (e.g., <Persona>, </Context>, <Tone>, <Input>) "
+    "are markup: keep every tag name and the angle brackets exactly "
+    "unchanged and correctly paired; translate only the text between "
+    "tags.\n"
     '- If an input paragraph is entirely source code or a shell/command '
     'line, copy it to "output" unchanged.'
 )
@@ -790,6 +1031,8 @@ def apply_babeldoc_patches() -> None:
     from babeldoc.format.pdf.document_il.midend import il_translator_llm_only
     from babeldoc.format.pdf.document_il.midend import paragraph_finder
     from babeldoc.format.pdf.document_il.midend import typesetting
+    from babeldoc.translator import cache as _translator_cache
+    from babeldoc.translator import translator as _translator_module
 
     il_translator.ILTranslator.pre_translate_paragraph = (
         _make_patched_pre_translate_paragraph(
@@ -801,6 +1044,15 @@ def apply_babeldoc_patches() -> None:
     )
     typesetting.Typesetting.retypeset_with_precomputed_scale = _make_patched_retypeset(
         typesetting.Typesetting.retypeset_with_precomputed_scale
+    )
+    _translator_module.OpenAITranslator.__init__ = _make_patched_openai_init(
+        _translator_module.OpenAITranslator.__init__
+    )
+    _translator_cache.TranslationCache.set = _make_patched_cache_set(
+        _translator_cache.TranslationCache.set
+    )
+    _translator_cache.TranslationCache.get = _make_patched_cache_get(
+        _translator_cache.TranslationCache.get
     )
     _patch_prompt_template(
         il_translator, _IL_RULES_ANCHOR, _IL_RULES_REPLACEMENT, "il_translator"
@@ -816,5 +1068,5 @@ def apply_babeldoc_patches() -> None:
     logger.info(
         "DocBabel BabelDOC patches applied "
         "(monospace/identifier skip, list splitting, prompt hardening, "
-        "orphan-line fix)"
+        "orphan-line fix, llm empty-response guard)"
     )
