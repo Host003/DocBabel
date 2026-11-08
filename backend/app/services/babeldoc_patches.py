@@ -1,6 +1,6 @@
 """DocBabel 针对 BabelDOC 的运行时补丁：技术文档翻译质量修复。
 
-修复三类问题（不修改 venv 内 BabelDOC 源码，猴子补丁随后端代码进镜像）：
+修复四类问题（不修改 venv 内 BabelDOC 源码，猴子补丁随后端代码进镜像）：
 
 Patch A —— 代码/选项/标识符不送翻译：
   包装 ILTranslator.pre_translate_paragraph（ILTranslatorLLMOnly 与
@@ -12,11 +12,15 @@ Patch A —— 代码/选项/标识符不送翻译：
   3. 其余混合段落中，等宽字体的 pdf_same_style_characters 片段被转换为
      PdfFormula，走公式占位符机制，LLM 只翻译周围的普通文字。
 
-Patch B —— 列表项拆分：
-  包装 ParagraphFinder.process_page：原版分段完成后，把多条列表项被合并成
-  一个段落的情况按视觉行重新拆开（每行一个段落），触发条件为 >=2 行以
-  列表标记（•/-/*/1./1.1/a. 等）开头且标记行占比过半；另有定义列表辅助
-  规则（行首为等宽字体且上一行以句末标点结尾也视为条目边界）。
+Patch B —— 列表项 / 索引 / 扉页标题拆分：
+  包装 ParagraphFinder.process_page：原版分段完成后，把多条语义行被合并成
+  一个段落的情况按视觉行重新拆开：
+  1. 列表项：>=2 行以列表标记（•/-/*/1./1.1/a./1 等）开头且标记行占比过半；
+     另有定义列表辅助规则（行首等宽字体且上一行以句末标点结尾）。
+  2. index/索引词条：>=3 行、多数行以页码结尾（23 / 133–136 / 5, 14, 130）
+     时，按“行尾页码”切分成一条词条一个段落；无页码的折行并入前一条。
+  3. 大字号多行标题（Part/附录扉页横幅，行高 >= 18pt）：每行独立成段，
+     避免中文变长后重排把下一行的文字挤到上一行行末。
 
 Patch C —— 提示词强化：
   在 il_translator / il_translator_llm_only 两个 PROMPT_TEMPLATE 中追加
@@ -70,6 +74,21 @@ _LIST_MARKER_RE = re.compile(
 )
 _LIST_SPLIT_MIN_MARKERS = 2
 _LIST_SPLIT_MIN_RATIO = 0.5
+# 曼宁书籍常用 "1 xxx" 这种无点号的编号列表
+_NUMBER_LIST_MARKER_RE = re.compile(r"^\s*\d{1,2}(?=[\s\u00a0]\S)")
+
+# index/索引词条段落：多行被合并成一个 PdfParagraph 时按词条拆开。
+# 词条行特征是行尾页码：23 / 133–136 / 5, 14, 130, 185, 229
+_INDEX_PAGE_TAIL_RE = re.compile(
+    r"\d{1,4}(?:(?:\s*[,;–—\-]\s*\d{1,4})+)?\s*$"
+)
+_INDEX_SPLIT_MIN_LINES = 3
+_INDEX_SPLIT_MIN_ENTRIES = 2
+_INDEX_SPLIT_MIN_RATIO = 0.6
+# 大字号多行标题（Part/附录扉页横幅）：按物理行拆开，避免翻译后把下一行
+# 文字挤到上一行行末；正文小标题行高约 13pt，不受影响
+_HEADING_SPLIT_MIN_HEIGHT = 18.0
+_HEADING_SPLIT_MAX_CHARS = 60
 _SENTENCE_FINAL_CHARS = (".", "?", "!")
 # 只对这些版面标签做列表拆分；表格单元格(fallback_line)、页眉页脚(abandon)等不动
 _LIST_SPLITTABLE_LABELS = {None, "plain text", "text", "paragraph_hybrid", "list"}
@@ -244,14 +263,6 @@ def _line_starts_monospace(line, font_map) -> bool:
 
 
 def _maybe_split_list_paragraph(finder, paragraph, font_map):
-    from babeldoc.format.pdf.document_il.il_version_1 import Box
-    from babeldoc.format.pdf.document_il.il_version_1 import PdfParagraph
-    from babeldoc.format.pdf.document_il.il_version_1 import (
-        PdfParagraphComposition,
-    )
-    from babeldoc.format.pdf.document_il.midend.paragraph_finder import (
-        generate_base58_id,
-    )
     from babeldoc.format.pdf.document_il.utils.layout_helper import (
         get_char_unicode_string,
     )
@@ -269,7 +280,10 @@ def _maybe_split_list_paragraph(finder, paragraph, font_map):
         for line in lines
     ]
     marker_flags = [
-        bool(_LIST_MARKER_RE.match(text)) if text else False for text in texts
+        bool(_LIST_MARKER_RE.match(text) or _NUMBER_LIST_MARKER_RE.match(text))
+        if text
+        else False
+        for text in texts
     ]
     marker_count = sum(marker_flags)
 
@@ -318,6 +332,23 @@ def _maybe_split_list_paragraph(finder, paragraph, font_map):
     if len(groups) < 2:
         return None
 
+    return _build_split_paragraphs(finder, paragraph, groups, "list")
+
+
+def _build_split_paragraphs(finder, paragraph, groups, reason: str):
+    """把按行分组的结果构建成多个 PdfParagraph，并重算它们的几何数据。"""
+    from babeldoc.format.pdf.document_il.il_version_1 import Box
+    from babeldoc.format.pdf.document_il.il_version_1 import PdfParagraph
+    from babeldoc.format.pdf.document_il.il_version_1 import (
+        PdfParagraphComposition,
+    )
+    from babeldoc.format.pdf.document_il.midend.paragraph_finder import (
+        generate_base58_id,
+    )
+
+    if len(groups) < 2:
+        return None
+
     new_paragraphs = []
     for group_lines in groups:
         comps = [PdfParagraphComposition(pdf_line=line) for line in group_lines]
@@ -334,11 +365,108 @@ def _maybe_split_list_paragraph(finder, paragraph, font_map):
         new_paragraphs.append(new_paragraph)
 
     logger.debug(
-        "DocBabel patch: split merged list paragraph %s into %d paragraphs",
+        "DocBabel patch: split merged %s paragraph %s into %d paragraphs",
+        reason,
         paragraph.debug_id,
         len(new_paragraphs),
     )
     return new_paragraphs
+
+
+def _line_box_height(line) -> float:
+    ys = []
+    y2s = []
+    for char in line.pdf_character:
+        box = getattr(char, "box", None)
+        if box is None:
+            continue
+        ys.append(box.y)
+        y2s.append(box.y2)
+    if not ys:
+        return 0.0
+    return max(y2s) - min(ys)
+
+
+def _maybe_split_index_paragraph(finder, paragraph):
+    """index/索引页段落：按“行尾页码”把合并的多条词条拆开。
+
+    BabelDOC 会把整栏索引词条合并成一个 PdfParagraph，排版后被当成连续
+    文本重排，词条串行、页码混进句子中间。这里按词条边界（行尾页码）分组，
+    无页码的折行（如 "AI (artificial intelligence), agents and applica-"
+    + "tions"）并入前一词条。
+    """
+    from babeldoc.format.pdf.document_il.utils.layout_helper import (
+        get_char_unicode_string,
+    )
+
+    if paragraph.layout_label not in _LIST_SPLITTABLE_LABELS:
+        return None
+    if getattr(paragraph, "vertical", False):
+        return None
+    lines = _get_visual_lines(finder, paragraph)
+    if not lines or len(lines) < _INDEX_SPLIT_MIN_LINES:
+        return None
+
+    texts = [
+        (get_char_unicode_string(line.pdf_character) or "").strip()
+        for line in lines
+    ]
+    entry_flags = [bool(text and _INDEX_PAGE_TAIL_RE.search(text)) for text in texts]
+    entry_count = sum(entry_flags)
+    if entry_count < _INDEX_SPLIT_MIN_ENTRIES:
+        return None
+    if entry_count / len(lines) < _INDEX_SPLIT_MIN_RATIO:
+        return None
+
+    groups = []
+    current = []
+    for line, text, is_entry in zip(lines, texts, entry_flags):
+        current.append(line)
+        if is_entry:
+            groups.append(current)
+            current = []
+    if current:
+        if groups:
+            groups[-1].extend(current)  # 尾部无页码的折行并入最后一条
+        else:
+            groups.append(current)
+    return _build_split_paragraphs(finder, paragraph, groups, "index")
+
+
+def _maybe_split_heading_paragraph(finder, paragraph):
+    """大字号多行标题（Part/附录扉页横幅）按物理行拆开。
+
+    这类标题每行都是独立语义行（如 "appendix A" / "Trying out LangChain"）。
+    若保持为一段，中文变长后重排会把下一行的文字挤到上一行行末。
+    """
+    from babeldoc.format.pdf.document_il.utils.layout_helper import (
+        get_char_unicode_string,
+    )
+
+    if getattr(paragraph, "vertical", False):
+        return None
+    lines = _get_visual_lines(finder, paragraph)
+    if not lines or len(lines) < 2:
+        return None
+
+    heights = [_line_box_height(line) for line in lines]
+    if min(heights) < _HEADING_SPLIT_MIN_HEIGHT:
+        return None
+
+    texts = [
+        (get_char_unicode_string(line.pdf_character) or "").strip()
+        for line in lines
+    ]
+    if any(not text for text in texts):
+        return None
+    if any(text.endswith(_SENTENCE_FINAL_CHARS) for text in texts):
+        return None
+    if any(len(text) > _HEADING_SPLIT_MAX_CHARS for text in texts):
+        return None
+
+    return _build_split_paragraphs(
+        finder, paragraph, [[line] for line in lines], "heading"
+    )
 
 
 def _split_list_paragraphs(finder, page) -> None:
@@ -350,6 +478,10 @@ def _split_list_paragraphs(finder, page) -> None:
     new_paragraphs = []
     for paragraph in page.pdf_paragraph or []:
         split = _maybe_split_list_paragraph(finder, paragraph, font_map)
+        if not split:
+            split = _maybe_split_index_paragraph(finder, paragraph)
+        if not split:
+            split = _maybe_split_heading_paragraph(finder, paragraph)
         if split:
             new_paragraphs.extend(split)
         else:
